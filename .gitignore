@@ -1,0 +1,10 @@
+# Editor / OS junk
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Backups created by install.sh
+*.bak-*
