@@ -1,0 +1,26 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-skills",
+  "id": "claude-skills",
+  "owner": {
+    "name": "14f3v"
+  },
+  "metadata": {
+    "description": "Personal user-scope Claude Code skills: internal-ca (2-tier PKI bootstrap), mtls (server-trusts-client mTLS), lxd-claude-setup (headless Claude Code setup on LXD/Linux).",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "claude-skills",
+      "source": "./",
+      "description": "Bundled PKI + ops skills: internal-ca, mtls, lxd-claude-setup. Battle-tested runbooks with frontmatter triggers so Claude Code can auto-activate them.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Khemphet SOUVANNAPHASY"
+      },
+      "keywords": ["pki", "tls", "mtls", "ca", "vault", "nginx", "lxd", "claude-code", "runbook"],
+      "category": "ops",
+      "strict": false
+    }
+  ]
+}

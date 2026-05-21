@@ -1,0 +1,15 @@
+{
+  "name": "claude-skills",
+  "description": "Personal user-scope Claude Code skills. Ships three runbook-style skills: internal-ca (2-tier PKI bootstrap with Vault, OCSP, CRL, Ansible deploy), mtls (server-trusts-client mutual TLS on top of internal-ca), and lxd-claude-setup (provision Claude Code on a headless LXD/Linux server including OAuth port-forward and TUI onboarding-loop fix).",
+  "version": "0.1.0",
+  "author": {
+    "name": "Khemphet SOUVANNAPHASY"
+  },
+  "license": "MIT",
+  "keywords": ["pki", "tls", "mtls", "ca", "vault", "nginx", "lxd", "claude-code", "runbook"],
+  "skills": [
+    "./skills/internal-ca",
+    "./skills/mtls",
+    "./skills/lxd-claude-setup"
+  ]
+}
