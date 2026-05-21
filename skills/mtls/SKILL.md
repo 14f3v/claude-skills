@@ -453,7 +453,54 @@ If you migrated from Phase C synthetic JSON, your existing `verify-mtls.sh` "Cli
 | Connection limits / DoS | None | `limit_req_zone`, `limit_conn_zone`, `client_max_body_size` per location. |
 | Audit log | Default `combined` format doesn't include client identity | Custom `log_format mtls '$remote_addr - $ssl_client_s_dn - $request - $status'` + dedicated `access_log` for the mTLS gateway. |
 
-### F.5 Backend trust contract
+### F.5 Extract a clean `X-Client-CN` via `map` (NGINX < 1.21.4)
+
+On NGINX 1.21.4+, you can use `$ssl_client_s_dn_cn` directly. On older NGINX (e.g. 1.18 on Ubuntu 20.04 — see G-mtls-3), the full DN is the only thing you get. To hand the backend a clean CN-only header, use a `map` block.
+
+**Maps must live at `http` context** — not inside `server`. The cleanest place is a small file under `/etc/nginx/conf.d/`, which Ubuntu's default `nginx.conf` includes from the `http` block. Don't put it in `sites-available/` (which is included inside the `server` context).
+
+`/etc/nginx/conf.d/<org>-maps.conf`:
+
+```nginx
+# Extract individual RDNs from $ssl_client_s_dn (RFC 2253 form).
+# Required on NGINX < 1.21.4 which has no built-in $ssl_client_s_dn_<rdn> vars.
+# Example subject: CN=macbook.branch.<org>.internal,OU=Branch Clients,O=Org,C=XX
+
+map $ssl_client_s_dn $client_cn {
+    default                  "";
+    "~CN=(?<cn>[^,]+)"       $cn;
+}
+
+# Repeat for other RDNs if backend needs them:
+# map $ssl_client_s_dn $client_ou { default ""; "~OU=(?<ou>[^,]+)" $ou; }
+# map $ssl_client_s_dn $client_o  { default ""; "~O=(?<o>[^,]+)"   $o;  }
+```
+
+Then in your gateway site (Phase F.2), add the proxy header right next to `X-Client-DN`:
+
+```nginx
+proxy_set_header X-Client-DN  $ssl_client_s_dn;
+proxy_set_header X-Client-CN  $client_cn;         # ← clean, just the CN
+```
+
+And include `$client_cn` in the local identity echo so you can verify the extraction without touching the backend:
+
+```nginx
+location = /_local/identity {
+    return 200 '{"verified":"$ssl_client_verify","cn":"$client_cn","dn":"$ssl_client_s_dn","serial":"$ssl_client_serial","fingerprint":"$ssl_client_fingerprint"}';
+    add_header Content-Type application/json;
+}
+```
+
+`nginx -t && systemctl reload nginx`. Then:
+
+```bash
+curl -sk --cacert <root> --cert <client> --key <key> \
+  https://<service-cn>/_local/identity
+# expect: "cn":"<extracted-cn-only>", "dn":"<full-DN>"
+```
+
+### F.6 Backend trust contract
 
 Document this clearly for backend developers — they need to know which headers are trustworthy:
 
