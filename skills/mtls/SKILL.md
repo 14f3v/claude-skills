@@ -328,6 +328,152 @@ Banner output: filenames to SCP to the endpoint device, passphrase, expiry, and 
 
 ---
 
+## Optional Phase F — TLS-terminating gateway (proxy_pass to backend)
+
+Once mTLS works with the synthetic `location /` from Phase C, the natural next step is to make NGINX a real **mTLS gateway**: terminate TLS + verify client cert at the edge, proxy to a plaintext HTTP backend on a trusted internal network. The backend reads the client's verified identity from headers — no token or session needed.
+
+### F.1 Architecture
+
+```
+Client (mTLS) ──HTTPS──> NGINX ──HTTP──> Backend (10.x.y.z:80)
+                          │
+                          ├─ verifies client cert against Root+Intermediate
+                          ├─ checks CRL bundle
+                          └─ injects X-Client-* headers (cannot be spoofed)
+```
+
+The internal hop is plaintext on purpose — internal network is trusted; backend would not implement TLS for every endpoint. Identity propagation via headers means the backend trusts what NGINX vouches for, **provided** the backend is not directly reachable from outside.
+
+### F.2 NGINX config template
+
+Replace the synthetic `location /` from Phase C with:
+
+```nginx
+upstream <org>_backend {
+    server <backend-ip>:80;
+    keepalive 16;
+}
+
+server {
+    listen 443 ssl;
+    server_name <service-cn> <service-ip>;
+
+    # Server cert + mTLS (unchanged from Phase C)
+    ssl_certificate     /etc/ssl/<org>/fullchain.crt;
+    ssl_certificate_key /etc/ssl/<org>/service.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_verify_client      on;
+    ssl_client_certificate /etc/ssl/<org>/client-ca-bundle.crt;
+    ssl_verify_depth       2;
+    ssl_crl                /etc/ssl/<org>/crl-bundle.pem;
+    ssl_stapling           on;
+    ssl_stapling_verify    on;
+    ssl_trusted_certificate /etc/ssl/<org>/root-ca.crt;
+
+    # Local liveness — does NOT hit backend (monitoring probe)
+    location = /health {
+        return 200 '{"healthy":true,"role":"mtls-gateway","client":"$ssl_client_s_dn"}';
+        add_header Content-Type application/json;
+    }
+
+    # Identity echo — useful for debugging mTLS without backend dependency
+    location = /_local/identity {
+        return 200 '{"verified":"$ssl_client_verify","dn":"$ssl_client_s_dn","serial":"$ssl_client_serial","fingerprint":"$ssl_client_fingerprint"}';
+        add_header Content-Type application/json;
+    }
+
+    # Everything else -> backend
+    location / {
+        proxy_pass http://<org>_backend;
+        proxy_http_version 1.1;
+
+        # Standard proxy hygiene
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $host;
+
+        # mTLS-derived identity — overrides anything client tried to send
+        proxy_set_header X-Client-Verify      $ssl_client_verify;
+        proxy_set_header X-Client-DN          $ssl_client_s_dn;
+        proxy_set_header X-Client-Serial      $ssl_client_serial;
+        proxy_set_header X-Client-Fingerprint $ssl_client_fingerprint;
+        proxy_set_header X-Client-Not-After   $ssl_client_v_end;
+
+        # Keepalive to upstream
+        proxy_set_header Connection "";
+
+        # Timeouts
+        proxy_connect_timeout 5s;
+        proxy_send_timeout    60s;
+        proxy_read_timeout    60s;
+
+        # Buffer sizes (raise for SPA bundles like Flutter web — 9 MB main.dart.js etc.)
+        proxy_buffers         16 16k;
+        proxy_buffer_size     16k;
+    }
+}
+```
+
+### F.3 Verification
+
+Adapt the Phase C verify script — the synthetic `/` is gone, so the "client identity visible" check moves to `/_local/identity`:
+
+```bash
+# Local liveness (no backend dependency)
+curl -sk --cacert <root> --cert <client> --key <client-key> \
+  https://<service-cn>/health
+# expect: {"healthy":true,...,"client":"CN=..."}
+
+# Identity echo (use this in verify-mtls.sh instead of grepping "/")
+curl -sk --cacert <root> --cert <client> --key <client-key> \
+  https://<service-cn>/_local/identity
+# expect: {"verified":"SUCCESS","dn":"CN=...","serial":"...","fingerprint":"..."}
+
+# Proxied path (hits backend)
+curl -sk --cacert <root> --cert <client> --key <client-key> \
+  https://<service-cn>/
+# expect: backend's actual response (HTML, JSON, etc.)
+
+# Negative case unchanged: no cert → HTTP 400; revoked cert → HTTP 400
+```
+
+If you migrated from Phase C synthetic JSON, your existing `verify-mtls.sh` "Client DN exposed" check will fail because it greps for `"client_dn"` in `/` response. Patch it to hit `/_local/identity` and grep `verified.*SUCCESS`.
+
+### F.4 Security caveats — must apply in production
+
+| Concern | Demo OK | Production must |
+|---|---|---|
+| Backend reachability | Backend on shared LAN — anyone on the LAN can hit it directly, bypassing mTLS | Backend listens **only** on its private interface (`bind 10.x.y.z:80`) or behind firewall rules that only allow the NGINX IP. mTLS at the gateway is bypassable if backend has any other open port. |
+| Header spoofing | `proxy_set_header X-Client-* $ssl_client_*` overrides client values — safe **if** every external request goes through this NGINX | If backend has any other ingress (LB, sidecar), each ingress must overwrite/strip `X-Client-*` identically. Otherwise: backend reads `X-Client-DN` from a request that bypassed NGINX. |
+| Plaintext internal hop | HTTP between NGINX and backend | If internal network is untrusted (multi-tenant cloud, shared VPC), use HTTPS upstream with `proxy_pass https://...` + `proxy_ssl_*` directives. Or service mesh (mTLS sidecar-to-sidecar). |
+| Identity normalisation | `$ssl_client_s_dn` is the full RFC 2253 DN — backend has to parse it | Extract CN cleanly via a `map` block: `map $ssl_client_s_dn $client_cn { default ""; "~CN=(?<cn>[^,]+)" $cn; }` then `proxy_set_header X-Client-CN $client_cn;`. (On NGINX 1.21.4+, `$ssl_client_s_dn_cn` is built-in.) |
+| Connection limits / DoS | None | `limit_req_zone`, `limit_conn_zone`, `client_max_body_size` per location. |
+| Audit log | Default `combined` format doesn't include client identity | Custom `log_format mtls '$remote_addr - $ssl_client_s_dn - $request - $status'` + dedicated `access_log` for the mTLS gateway. |
+
+### F.5 Backend trust contract
+
+Document this clearly for backend developers — they need to know which headers are trustworthy:
+
+```
+TRUSTED headers (set by mTLS gateway, cannot be spoofed by external client):
+  X-Client-Verify       'SUCCESS' if mTLS handshake passed
+  X-Client-DN           full RFC 2253 subject DN
+  X-Client-Serial       cert serial (hex string) - use as device identifier
+  X-Client-Fingerprint  SHA1 fingerprint of presented cert
+  X-Client-Not-After    cert expiry timestamp
+
+Backend MUST reject the request if X-Client-Verify != "SUCCESS".
+Use X-Client-Serial or X-Client-Fingerprint as the device identifier in
+audit logs — survives CN changes, unique per cert.
+
+Do NOT trust any other X-Client-* header (not set by gateway, may be client-supplied).
+```
+
+---
+
 ## After E — when scaling
 
 Adding `iphone.branch.<org>.internal`, `laptop.branch.<org>.internal`, etc. = **just re-run Phase A with a different CN**. No NGINX changes, no CRL bundle rebuild needed (Intermediate CA + trust bundle already cover all clients signed by it). Each device gets its own .p12.
