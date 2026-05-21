@@ -1,6 +1,6 @@
 # claude-skills
 
-Portable Claude Code skills for PKI / mTLS work. Each skill encodes a multi-phase implementation plus the gotchas learned from running it end-to-end on real hosts (Ubuntu 20.04, NGINX 1.18, Vault 2.0).
+Portable Claude Code **user-scope** skills, version-controlled so the same skills are available on every machine you use. Each skill encodes a multi-phase runbook plus the gotchas learned from running it end-to-end on real hosts.
 
 ## What's in here
 
@@ -8,8 +8,13 @@ Portable Claude Code skills for PKI / mTLS work. Each skill encodes a multi-phas
 |---|---|
 | [`skills/internal-ca`](skills/internal-ca/SKILL.md) | Bootstrap a 2-tier internal Certificate Authority on a Linux host: Root CA → Intermediate CA → service certs, plus HashiCorp Vault PKI engine, OCSP responder, CRL HTTP server, Ansible deploy playbook, and a 3-mode revocation script. Designed for demo/lab use; surfaces production-hardening pointers without auto-executing them. |
 | [`skills/mtls`](skills/mtls/SKILL.md) | Add mutual TLS (server-trusts-client) on top of an existing internal CA + NGINX HTTPS setup. Issues `clientAuth` certs, bundles as PKCS#12 for endpoint install, enforces `ssl_verify_client` with a Root+Intermediate trust bundle, and wires CRL-based revocation. |
+| [`skills/lxd-claude-setup`](skills/lxd-claude-setup/SKILL.md) | Provision Claude Code on a headless LXD / Linux server (Proxmox or bare): SSH fingerprint reset, password auth, passwordless key copy, Node.js install, Claude Code install pinned to a working version, OAuth login via SSH port-forward for Max subscriptions, and the TUI onboarding-loop fix. |
 
-Both skills cross-reference each other: `internal-ca` hands off to `mtls` when client cert work comes up; `mtls` assumes `internal-ca` outputs are in place.
+`internal-ca` and `mtls` cross-reference each other: `internal-ca` hands off to `mtls` when client cert work comes up; `mtls` assumes `internal-ca` outputs are in place.
+
+### Scope: what this repo does *not* manage
+
+This repo is the source of truth for **user-scope** skills (`~/.claude/skills/<name>`). It intentionally does **not** mirror skills delivered by plugins (under `~/.claude/plugins/`) — e.g. the `superpowers:*`, `astronomer-data:*`, `ui-ux-pro-max:*`, `skill-creator`, `frontend-design`, `claude-api`, and the various Anthropic agent-skills marketplace entries. Those are owned and updated by their plugin marketplaces; copying them in here would diverge and rot. Install/update them through the plugin system, not this repo.
 
 ## Install
 
@@ -80,8 +85,10 @@ claude-skills/
 └── skills/
     ├── internal-ca/
     │   └── SKILL.md                 2-tier PKI bootstrap
-    └── mtls/
-        └── SKILL.md                 server-trusts-client mTLS
+    ├── mtls/
+    │   └── SKILL.md                 server-trusts-client mTLS
+    └── lxd-claude-setup/
+        └── SKILL.md                 Claude Code on headless LXD/Linux
 ```
 
 ## Why these are useful even without Claude
