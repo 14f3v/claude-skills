@@ -500,7 +500,139 @@ curl -sk --cacert <root> --cert <client> --key <key> \
 # expect: "cn":"<extracted-cn-only>", "dn":"<full-DN>"
 ```
 
-### F.6 Backend trust contract
+### F.6 Gateway access logging (mTLS audit trail)
+
+Default NGINX `combined` log format omits client cert info — useless for an mTLS audit trail. Set up a dedicated log format that captures **who** (client CN, serial), **what** (request + status), **how fast** (request + upstream time), and **how** (TLS version + cipher) per request.
+
+Add to `/etc/nginx/conf.d/<org>-maps.conf` (same file as the CN map — both must be at `http` context):
+
+```nginx
+log_format mtls_audit '$remote_addr - "$client_cn" [$time_local] '
+                      '"$request" $status $body_bytes_sent '
+                      'rt=$request_time urt=$upstream_response_time '
+                      'serial=$ssl_client_serial verify=$ssl_client_verify '
+                      'tls=$ssl_protocol/$ssl_cipher '
+                      'ua="$http_user_agent"';
+```
+
+In the `server { listen 443 ssl; }` block (Phase F.2), add right after `server_name`:
+
+```nginx
+access_log /var/log/nginx/<org>-access.log mtls_audit;
+error_log  /var/log/nginx/<org>-error.log warn;
+```
+
+And inside `location = /health` add `access_log off;` — health probes are chatty and low-value, they pollute the audit trail. Identity-echo (`/_local/identity`) and proxied paths should stay logged.
+
+#### Sample output
+
+```
+127.0.0.1 - "macbook.branch.mjbl.internal" [21/May/2026:10:27:48 +0000] "GET / HTTP/1.1" 200 5631 rt=0.002 urt=0.000 serial=1002 verify=SUCCESS tls=TLSv1.3/TLS_AES_256_GCM_SHA384 ua="MJBL-Demo-Client/1.0"
+127.0.0.1 - ""                              [21/May/2026:10:27:48 +0000] "GET / HTTP/1.1" 400 246  rt=0.000 urt=-     serial=-    verify=NONE                  tls=TLSv1.3/...  ua="anonymous-attacker"
+127.0.0.1 - "macbook.branch.mjbl.internal" [21/May/2026:10:27:48 +0000] "GET / HTTP/1.1" 400 224  rt=0.000 urt=-     serial=1001 verify=FAILED:certificate revoked tls=TLSv1.3/... ua="revoked-client-v1"
+```
+
+Every rejection has its own line with the failure reason in the `verify=` field — easy to detect compromised-cert use, expired certs, or unauthorized clients hitting the door.
+
+#### Useful monitoring queries
+
+```bash
+# Live tail
+tail -F /var/log/nginx/<org>-access.log
+
+# Count by verify status (look for spikes of FAILED or NONE)
+awk '{for(i=1;i<=NF;i++) if($i ~ /^verify=/) print $i}' \
+  /var/log/nginx/<org>-access.log | sort | uniq -c
+
+# Unique client CNs that authenticated successfully
+grep 'verify=SUCCESS' /var/log/nginx/<org>-access.log \
+  | awk -F'"' '{print $2}' | sort -u
+
+# All rejected attempts (revoked, no-cert, expired)
+grep -E 'verify=(NONE|FAILED)' /var/log/nginx/<org>-access.log
+
+# Slowest requests (top N by total time)
+grep -oE 'rt=[0-9.]+' /var/log/nginx/<org>-access.log \
+  | sort -t= -k2 -rn | head -10
+
+# Requests by a specific client CN
+grep '"branch-001.<device>.<org>.internal"' /var/log/nginx/<org>-access.log
+
+# Per-hour request count (basic activity heatmap)
+awk '{split($4, a, ":"); print a[2]":"a[3]}' /var/log/nginx/<org>-access.log \
+  | sort | uniq -c
+```
+
+#### JSON variant for SIEM ingestion
+
+The text format is great for `tail` + `grep` + `awk`. For SIEM (ELK, Loki, Splunk, Datadog), use a parallel JSON-formatted log:
+
+```nginx
+log_format mtls_audit_json escape=json
+  '{'
+    '"time":"$time_iso8601",'
+    '"remote_addr":"$remote_addr",'
+    '"client_cn":"$client_cn",'
+    '"client_dn":"$ssl_client_s_dn",'
+    '"client_serial":"$ssl_client_serial",'
+    '"verify":"$ssl_client_verify",'
+    '"request":"$request",'
+    '"status":$status,'
+    '"body_bytes":$body_bytes_sent,'
+    '"request_time":$request_time,'
+    '"upstream_time":"$upstream_response_time",'
+    '"upstream_addr":"$upstream_addr",'
+    '"tls_protocol":"$ssl_protocol",'
+    '"tls_cipher":"$ssl_cipher",'
+    '"user_agent":"$http_user_agent"'
+  '}';
+```
+
+Either replace `mtls_audit` with `mtls_audit_json`, or write both in parallel:
+
+```nginx
+access_log /var/log/nginx/<org>-access.log      mtls_audit;
+access_log /var/log/nginx/<org>-access.json.log mtls_audit_json;
+```
+
+#### Logrotate
+
+Audit logs need long-enough retention that you can investigate yesterday's anomaly. Default `nginx` logrotate gives 14 days — too short for security forensics. Write a dedicated config so audit logs survive longer than ordinary nginx logs:
+
+`/etc/logrotate.d/<org>-nginx`:
+
+```
+/var/log/nginx/<org>-access.log
+/var/log/nginx/<org>-error.log
+{
+    daily
+    rotate 30                          # 30 days demo; 365+ for prod compliance
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640 www-data adm
+    sharedscripts
+    postrotate
+        [ -f /run/nginx.pid ] && kill -USR1 $(cat /run/nginx.pid)
+    endscript
+}
+```
+
+Test with `sudo logrotate -d /etc/logrotate.d/<org>-nginx` (dry run, no rotation actually happens).
+
+#### Production considerations
+
+| Concern | Demo OK | Production must |
+|---|---|---|
+| Local-only storage | Fine for demo | **Ship logs off-host** — local disk is the wrong place for the only copy of an audit trail. Use `syslog:server=<host>` in `access_log` directive, or run a Vector/Promtail/Fluentbit sidecar to ship to SIEM. |
+| Retention | 30 days | Often **≥ 1 year** for compliance (PCI-DSS, ISO 27001, SOC 2). Local logrotate is not the right answer — write to immutable storage (S3 with Object Lock, dedicated SIEM). |
+| PII in logs | User-Agent is harmless | If the application embeds PII in URLs (`/users/<email>?token=...`), the access log captures it. Use `set $loggable_uri $request;` + a `map` to strip sensitive query params before logging. |
+| Log injection | None in this demo | A malicious `User-Agent` or CN containing `\n` could inject a fake log line. NGINX's `escape=default` (the default) escapes characters, but verify if you change the format. |
+| Disk full = no writes | Could happen on long demos | Monitor `/var/log/nginx/` free space; alert at 80%. NGINX will return 500 if it can't write logs and `access_log` doesn't have `if=` to make it optional. |
+| Health probe noise | Already handled (`access_log off` on `/health`) | Same for any other liveness/readiness path your LB hits. |
+
+### F.7 Backend trust contract
 
 Document this clearly for backend developers — they need to know which headers are trustworthy:
 
