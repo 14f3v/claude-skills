@@ -661,6 +661,98 @@ Revoke per device via `nuke.sh serial <client-serial>` (from the [[internal-ca]]
 
 ---
 
+## Phase G — Domain-classified client certs (Approach A)
+
+When the deployment grows beyond "one OU for everyone" and you need to mark which **business domain** each client belongs to (Agency / Microloan / Payment / Branch / Ops / Support / etc.), extend with **Approach A: OU-based classification on the existing single Intermediate CA**.
+
+**What it gets you:** the subject DN of each client cert carries `OU=<Domain>`, exposed in `$ssl_client_s_dn` at the gateway. The gateway can extract it via a `map` and either pass it as `X-Client-Domain` for backend-layer authorization or apply per-location allow-lists at the edge.
+
+**What it does NOT change:**
+- The CA hierarchy stays Root → single Intermediate (no new keys, no new CRLs)
+- Trust bundle (`client-ca-bundle.crt`) stays the same
+- CRL bundle and CRL distribution stay the same — all clients across all domains share the same Intermediate CRL
+- In-cluster CRL refresh CronJob: zero change. Same Service `crl-upstream`, same script, same `grep -c 'BEGIN X509 CRL' == 2` invariant.
+
+**Forward-compatible with Approach D** (sub-Intermediate per domain): when one domain eventually needs cryptographic isolation (typically `Payment` under banking regulator scrutiny), spin up a parallel sub-Intermediate, concatenate it into the trust bundle, add its CRL to the CRL bundle. Other domains keep using the shared Intermediate; no migration of existing certs.
+
+### Layout on the bare-metal CA VM
+
+```
+/opt/<org>/ca/domains.allowlist                ← whitelist of legal OU values
+                                                 (one per line; case-insensitive lookup; comments OK)
+
+/opt/<org>/ca/intermediate/certs/clients/
+├── _registry.tsv                              ← append-only TSV: timestamp/domain/device/serial/issued_by/status
+└── <domain-lower>/                            ← per-domain dir
+    ├── <device-id>-<serial>.key               ← mode 0400
+    ├── <device-id>-<serial>.csr
+    ├── <device-id>-<serial>.crt
+    ├── <device-id>-<serial>.p12               ← mode 0600, ship to device
+    ├── <device-id>-<serial>.meta              ← issuance details
+    └── <device-id>.current                    ← text file with the active serial
+
+/opt/<org>/scripts/
+├── issue-client-cert.sh                       ← <device-id> <domain> [--validity-days N]
+└── revoke-client-cert.sh                      ← <device-id> <domain> [--serial N]
+```
+
+### Issue script — what it does internally
+
+1. Validates device-id format (`^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$` — DNS-label-safe)
+2. Looks up domain in `/opt/<org>/ca/domains.allowlist` (case-insensitive → canonical case)
+3. Reads next serial from `/opt/<org>/ca/intermediate/serial`
+4. Generates 4096-bit RSA key
+5. CSR with subject: `/C=XX/O=<Org>/OU=<Domain>/CN=<device-id>.<domain-lower>.<org>.internal`
+6. Signs via `openssl ca -extensions v3_client_cert` — uses the existing extension section in `openssl-intermediate.cnf` (clientAuth EKU + CRL DP + OCSP AIA — **no new extension section needed**)
+7. Builds PKCS#12 bundle (key + leaf + intermediate)
+8. Writes serial-suffixed artifacts + updates `.current` marker + appends to `_registry.tsv`
+
+Re-issuance for an existing device-id is allowed: new serial, old serial stays valid until explicitly revoked (rolling-rotation overlap window).
+
+### Gateway-side OU extraction (optional but recommended)
+
+Add to the http-context configmap (`mjbl-maps.conf` in K8s or `conf.d/<org>-maps.conf` on bare-metal):
+
+```nginx
+map $ssl_client_s_dn $client_domain {
+    default                "";
+    "~OU=(?<ou>[^,]+)"     $ou;
+}
+```
+
+In the server block, propagate or enforce:
+
+```nginx
+# Forward the domain to backend (TLS-layer-verified, trustable):
+proxy_set_header X-Client-Domain $client_domain;
+
+# Or enforce at the gateway:
+location /api/microloan/ {
+    if ($client_domain != "Microloan") { return 403; }
+    proxy_pass http://microloan_backend;
+}
+```
+
+### Registry audit
+
+```
+$ sudo column -t -s $'\t' /opt/<org>/ca/intermediate/certs/clients/_registry.tsv
+timestamp             domain     device_id    serial  issued_by  status
+2026-06-02T10:52:59Z  Microloan  test-001     1004    mjbl       active
+2026-06-02T11:30:14Z  Payment    teller-jdoe  1005    mjbl       active
+2026-06-08T14:22:01Z  Microloan  test-001     1004    mjbl       revoked-20260608
+```
+
+### G-mtls-8 — OU is a label, not a boundary
+
+The OU field is just text signed by the CA. Anyone with the Intermediate CA's signing key could mint a cert with any OU. This is fine for OU as **classification metadata for routing/audit**, but DO NOT use OU alone as the cryptographic boundary for high-stakes authorization (money movement, key release). For that, move the relevant domain to a sub-Intermediate (Approach D) so the chain itself proves the classification.
+
+### Trigger phrases for this phase
+
+User says: "domain-classified", "OU-based client certs", "per-business-domain certs", "Agency / Microloan / Payment client cert", "add a new business domain", "issue client cert for X domain" → this phase.
+
+---
+
 ## Production hardening pointers (do NOT execute by default)
 
 When the user finishes Phase E demo, surface this list as a deferred to-do — do not auto-execute:
