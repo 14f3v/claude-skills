@@ -12,6 +12,22 @@ Portable Claude Code **user-scope** skills, version-controlled so the same skill
 
 `internal-ca` and `mtls` cross-reference each other: `internal-ca` hands off to `mtls` when client cert work comes up; `mtls` assumes `internal-ca` outputs are in place.
 
+## MJBL mTLS platform suite (`/mjbl:mtls:*`)
+
+Operational skills for the **live MJBL mTLS ecosystem deployed on this host** — distinct from the generic `internal-ca` / `mtls` how-to skills above. Each one **indexes the authoritative runbooks under `/home/mjbl/*` as source-of-truth** (this host is the mTLS *remote runner*) and distills the live facts (hosts, IPs, services, paths, gotchas). Invoke via the `/mjbl:mtls:<command>` wrappers, or let Claude auto-activate the skill from its frontmatter triggers.
+
+| Skill | Command | What it covers |
+|---|---|---|
+| [`mjbl-mtls-platform`](skills/mjbl-mtls-platform/SKILL.md) | `/mjbl:mtls:platform` | Ecosystem map + KB index (entry point): CA host, relay, gateway, device app, portal; 3-cluster topology; an index of every `/home/mjbl/mjbl-*.md` runbook. |
+| [`mjbl-ca-operations`](skills/mjbl-ca-operations/SKILL.md) | `/mjbl:mtls:ca` | Prod CA host `10.88.1.116`: Vault 2-tier PKI, OCSP/CRL (`refresh-crl.sh`), CA-host rotation, prod hardening. |
+| [`mjbl-enrollment-plane`](skills/mjbl-enrollment-plane/SKILL.md) | `/mjbl:mtls:enroll` | Signer (`mjbl-enroll-signer` :8444) + relay (LB `10.88.101.143:8443`): mint/sign/revoke/allowlist, logs, relay-cert rotation. |
+| [`mjbl-client-provisioning`](skills/mjbl-client-provisioning/SKILL.md) | `/mjbl:mtls:client` | agency_v2 device app: build-time dart-defines, Model-A enrollment, signed APK + Firebase distribution, claim-QR. |
+| [`mjbl-cert-lifecycle`](skills/mjbl-cert-lifecycle/SKILL.md) | `/mjbl:mtls:cert` | Cert rotation (relay/CA) + the **3-hop** device revocation chain + the revocation post-mortem. |
+| [`mjbl-operator-portal`](skills/mjbl-operator-portal/SKILL.md) | `/mjbl:mtls:portal` | Operator portal BFF / RBAC / LDAP-HTTP-delegate + signer admin endpoints + P5 cutover. |
+| [`mjbl-mtls-troubleshooting`](skills/mjbl-mtls-troubleshooting/SKILL.md) | `/mjbl:mtls:troubleshoot` | Symptom→cause→fix decision tree for enrollment/mTLS failures (e.g. "could not reach", revoked-device-still-works). |
+
+> The `/mjbl:mtls:*` slash commands live in `commands/mjbl/mtls/` and load via the plugin system. After pulling, run `/plugin install claude-skills@claude-skills` (or reload the plugin) and restart Claude Code so they register. The skills themselves also install via `./install.sh` (symlink mode auto-discovers every `skills/<name>/`).
+
 ### Scope: what this repo does *not* manage
 
 This repo is the source of truth for **user-scope** skills (`~/.claude/skills/<name>`). It intentionally does **not** mirror skills delivered by plugins (under `~/.claude/plugins/`) — e.g. the `superpowers:*`, `astronomer-data:*`, `ui-ux-pro-max:*`, `skill-creator`, `frontend-design`, `claude-api`, and the various Anthropic agent-skills marketplace entries. Those are owned and updated by their plugin marketplaces; copying them in here would diverge and rot. Install/update them through the plugin system, not this repo.
