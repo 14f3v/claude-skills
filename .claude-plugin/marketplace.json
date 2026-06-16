@@ -6,19 +6,19 @@
     "name": "14f3v"
   },
   "metadata": {
-    "description": "Personal user-scope Claude Code skills: internal-ca (2-tier PKI bootstrap), mtls (server-trusts-client mTLS), lxd-claude-setup (headless Claude Code setup on LXD/Linux), and a bare-metal Kubernetes family — k8s-bare-metal (kubeadm + Rancher, single-node/HA/join), harbor-registry (private Harbor with self-signed CA), cicd-platform (Argo CD + self-hosted Actions runners).",
-    "version": "0.2.0"
+    "description": "Personal user-scope Claude Code skills: internal-ca (2-tier PKI bootstrap), mtls (server-trusts-client mTLS), lxd-claude-setup (headless Claude Code setup on LXD/Linux), a bare-metal Kubernetes family — k8s-bare-metal (kubeadm + Rancher, single-node/HA/join), harbor-registry (private Harbor with self-signed CA), cicd-platform (Argo CD + self-hosted Actions runners) — and the MJBL mTLS platform suite (live deployed ecosystem on this host: platform/ca/enrollment/client/cert-lifecycle/operator-portal/troubleshooting, indexing the /home/mjbl/* runbooks).",
+    "version": "0.3.0"
   },
   "plugins": [
     {
       "name": "claude-skills",
       "source": "./",
-      "description": "Bundled PKI + ops + bare-metal Kubernetes skills, with /k8s-setup, /harbor-setup, /cicd-setup commands. Battle-tested runbooks with frontmatter triggers so Claude Code can auto-activate them.",
-      "version": "0.2.0",
+      "description": "Bundled PKI + ops + bare-metal Kubernetes skills (/k8s-setup, /harbor-setup, /cicd-setup) PLUS the MJBL mTLS platform suite under /mjbl:mtls:* (platform, ca, enroll, client, cert, portal, troubleshoot) — operational skills for the live MJBL mTLS ecosystem that index the /home/mjbl/* runbooks as source-of-truth. Battle-tested runbooks with frontmatter triggers so Claude Code can auto-activate them.",
+      "version": "0.3.0",
       "author": {
         "name": "Khemphet SOUVANNAPHASY"
       },
-      "keywords": ["pki", "tls", "mtls", "ca", "vault", "nginx", "lxd", "claude-code", "runbook", "kubernetes", "k8s", "kubeadm", "rancher", "harbor", "argocd", "helm", "bare-metal"],
+      "keywords": ["pki", "tls", "mtls", "ca", "vault", "nginx", "lxd", "claude-code", "runbook", "kubernetes", "k8s", "kubeadm", "rancher", "harbor", "argocd", "helm", "bare-metal", "mjbl", "enrollment", "signer", "relay", "revocation"],
       "category": "ops",
       "strict": false
     }

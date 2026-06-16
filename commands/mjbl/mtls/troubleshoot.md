@@ -1,0 +1,15 @@
+---
+description: Diagnose a broken enrollment / mTLS symptom (symptom → cause → fix decision tree). Wraps the mjbl-mtls-troubleshooting skill (MJBL mTLS platform).
+argument-hint: "<symptom>  e.g. \"could not reach enrollment server\" | revoked device still works"
+---
+
+Use the **mjbl-mtls-troubleshooting** skill as the authoritative source for diagnosing enrollment / mutual-TLS failures on the MJBL mTLS platform. The skill indexes the runbooks under `/home/mjbl/*` (this host is the mTLS remote runner) — treat those as the source of truth: `mjbl-mtls-revocation-postmortem.md`, the signer source `mjbl-mtls-enrollment/signer/mjbl_enroll_signer.py`, the client `agency_v2/lib/services/mtls.dart` error map, and every sibling `mjbl-*` skill (this is the cross-cutting triage front door).
+
+Context from $ARGUMENTS: the broken **symptom** to diagnose. Map it into the right decision tree:
+- "could not reach the enrollment server" / hangs / times out → **Tree A (transport)**: it's `EnrollNetworkException` (SocketException/Handshake/timeout), **NOT** a 403/allowlist. Check relay health (`getent` → 10.88.101.143, `openssl s_client :8443`, `/healthz`, TCP :8443); prove arrival by watching `/var/log/mjbl-enrollment.log` while the device retries (no line = network/DNS; a line = it arrived); the `.local`/mDNS trap (switch `MTLS_ENROLL_BASE` to IP `10.88.101.143` or `enroll.maruhanjapanbanklao.com`); the signer `_read_json` body-read hang (no socket timeout → silent, no log). Allowlist gives a clean **403**, not "could not reach".
+- "revoked device still works / still logs in" → **Tree B (revocation)**: a missed CRL hop — `vault revoke` alone does NOT enforce. Check the signer revoke audit for `crl_status:403 / crl_published:false` (the missing `pki/crl/rotate` grant — IaC drift), then walk all 3 hops (signer rotate → CA-host `refresh-crl.sh` `:8888` → cluster `mjbl-crl-refresh` CronJob roll) and re-handshake (TLS 1.3 keeps a kept-alive conn; refused cert → 400). Watch the wrong-kubeconfig red herring.
+- "rejected at the gateway" / `HandshakeException` / SAN mismatch → **Tree C**: wrong API base (`agenttest` is RETIRED → SAN is `microloan` only), expired/old-chain leaf, or `_cachedContext` not rebuilt after re-enroll.
+- "signer/relay down" → **Tree D**: `systemctl status mjbl-enroll-signer`, `:8444/healthz`, relay pods, `502 signer_tls_error` (signer needs IP SAN 10.88.1.116), Secret-clobber crashloop, or Vault sealed.
+If empty, summarize the layer-triage table (what each device error / `EnrollmentException` means) and ask for the exact symptom + what the device shows.
+
+Read the specific /home/mjbl runbook the skill points to BEFORE executing any prod-touching step, and respect the prod gates: CA-host inspection/changes go via `! ssh ca` (the agent cannot reach the CA host directly), k8s-config merges are user-gated, ArgoCD prod writes are user-gated/denied to the agent. Never `kubectl apply` a TLS Secret or `kubectl get secret … -o yaml/json` (leaks `tls.key`). Diagnose read-only first; verify the actual fix against the owning plane skill before mutating prod.
