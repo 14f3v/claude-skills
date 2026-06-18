@@ -1,7 +1,7 @@
 ---
 name: mjbl-ca-operations
-description: This skill should be used when the user asks to operate, rotate, or harden the live MJBL production CA — "check vault status / unseal vault", "refresh the CRL", "rotate the root/intermediate CA", "rotate the gateway server cert", "rotate vault token / move keys off-host", "publish a CRL", "set up OCSP for the gateway", "harden the CA host", "revoke a serial on the CA host", or any PKI/Vault/OCSP/CRL operation on the CA host (10.88.1.116). This is the MJBL mTLS platform — the live deployed PKI ecosystem on this host. It indexes the authoritative runbooks under /home/mjbl and distills the live prod facts.
-version: 0.1.0
+description: This skill should be used when the user asks to operate, rotate, or harden the live MJBL production CA — "check vault status / unseal vault", "refresh the CRL", "rotate the root/intermediate CA", "rotate the gateway server cert", "rotate vault token / move keys off-host", "publish a CRL", "set up OCSP for the gateway", "harden the CA host", "revoke a serial on the CA host", "issue a standalone serverAuth cert for an internal service (non-gateway — e.g. a Rancher/admin UI on a separate, isolated cluster)", or any PKI/Vault/OCSP/CRL operation on the CA host (10.88.1.116). This is the MJBL mTLS platform — the live deployed PKI ecosystem on this host. It indexes the authoritative runbooks under /home/mjbl and distills the live prod facts.
+version: 0.2.0
 ---
 
 # MJBL CA Operations — Vault PKI / OCSP / CRL / rotation / hardening
@@ -18,6 +18,7 @@ version: 0.1.0
 - "Refresh / publish the CRL", a CRL `nextUpdate` is approaching, or a revoked device isn't being rejected (CRL not propagated through all hops).
 - "Rotate the root CA" / "rotate the intermediate" / "rotate the gateway server cert" / "rotate the OCSP responder cert" / "rotate the Vault token or unseal keys."
 - "Revoke a cert / serial on the CA host" (the signer/operator-portal path also exists; this is the CA-host `nuke.sh` path).
+- "Issue a standalone server cert" / "issue a serverAuth cert for an internal service" — a cert for a host that is **NOT** the gateway (e.g. a Rancher/admin UI on a separate, isolated cluster). Use the dedicated standalone issuer (`scripts/issue-standalone-server-cert.sh`), **never** the gateway tool.
 - "Harden the CA" / "get keys off the host" / "set up AppRole" / "auto-unseal" / "wire Fleet."
 - "Set up OCSP at the gateway" / real-time per-handshake revocation design.
 - Any direct PKI/Vault/OpenSSL operation on the CA host that touches trust material.
@@ -42,7 +43,14 @@ version: 0.1.0
 
 **Revoke a cert/serial on the CA host** (rotation §3/§4): `MJBL_AUTO=1 nuke.sh serial <serial>` then `refresh-crl.sh`. Full enforcement = **3 hops**: (1) vault revoke + `vault READ pki/crl/rotate`; (2) **`refresh-crl.sh` on the CA host** (easy to miss); (3) cluster CronJob (or force-job) rolls nginx. Verify the device is rejected at the TLS layer (400 / handshake fail).
 
-**Server-cert rotation** (rotation §3, routine 90d): `vault write -format=json pki/issue/mjbl-platform-role common_name=… ip_sans=… ttl=2160h` → `jq` key + `.data.certificate,.data.ca_chain[]` into `/etc/ssl/mjbl/` → propagate per cluster (`bootstrap-secrets.sh` / `deploy-server-cert.sh`) → verify the handshake serves the new serial. **No cluster-side auto-renew yet** (propagation gap).
+**Server-cert rotation** (rotation §3, routine 90d): `vault write -format=json pki/issue/mjbl-platform-role common_name=… ip_sans=… ttl=2160h` → `jq` key + `.data.certificate,.data.ca_chain[]` into `/etc/ssl/mjbl/` → propagate per cluster (`bootstrap-secrets.sh` / `deploy-server-cert.sh`) → verify the handshake serves the new serial. **No cluster-side auto-renew yet** (propagation gap). ⚠️ This is the **gateway** cert tool — see the next entry for non-gateway services.
+
+**Standalone (non-gateway) server-cert issuance** — for an internal service that must NOT disturb the gateway (e.g. a Rancher/admin UI on a separate, isolated cluster). Use **`scripts/issue-standalone-server-cert.sh`** (bundled in this skill; install to `/opt/mjbl-demo/scripts/` on the CA host). It is the *gateway-safe* counterpart to `issue-server-cert.sh`: it writes **only** to a chosen `--out` dir (hard-refuses `/etc/ssl/mjbl`, `/opt/mjbl-ca`, `/opt/mjbl-demo`), never propagates to the gateway, never mutates a role, and supports **`--csr`** (sign mode → the private key never leaves the target host). Steps:
+1. Generate the key + CSR **on the target host** — `openssl req -new -newkey rsa:2048 -nodes -keyout svc.key -out svc.csr -subj "/CN=<fqdn>" -addext "subjectAltName=DNS:<fqdn>[,IP:<ip>]"` (keeps the key off the CA).
+2. Use/create a **dedicated internal role** so the gateway's `mjbl-platform-role` is untouched — `vault write pki/roles/mjbl-internal-server-role allowed_domains="<internal-domain>" allow_subdomains=true allow_ip_sans=true server_flag=true client_flag=false key_type=rsa key_bits=2048 ttl=2160h max_ttl=2160h country=LA organization=MJBL ou="PKI Infrastructure"`.
+3. Mint a **short-lived, scoped token** (policy = `create/update` on `pki/sign/mjbl-internal-server-role` + `read` on the role) into a file — never the root token; Vault must be unsealed.
+4. `ssh ca 'sudo -n bash -s -- <fqdn> --role mjbl-internal-server-role --csr /tmp/svc.csr --ip <ip> --out /tmp/out --token-file /tmp/scoped.token' < scripts/issue-standalone-server-cert.sh`.
+5. Pull back the **public** `fullchain.crt` (leaf+intermediate) + `ca-chain.crt` (read root-owned `--out` via `sudo cat`), install with the key on the target, and verify chain→MJBL Root + key/cert modulus match before wiring it in. *(First real use: the `drk8s.vte.mjblao.local` DR-Rancher cert, 2026-06-18.)*
 
 **Intermediate rotation** (rotation §2, ~3–5yr): mint new int key+CSR, Root signs (`pathlen:0`, 3650d) → import to Vault (`pki/intermediate/set-signed` or new `pki_int_v2/`) → rebuild bundle **root + BOTH intermediates** → propagate → reissue server cert + trigger client renewal → keep old int CRL until last old leaf expires → retire.
 
@@ -66,6 +74,7 @@ version: 0.1.0
 - **OCSP responder (`:2560`) and Vault revocation are NOT auto-synced** — the openssl responder reads `index.txt`; `vault write pki/revoke` won't update it. `nuke.sh` revokes via both pathways.
 - **OVERLAP→SWITCH→RETIRE, never retire-then-mint.** A broken chain fails every mTLS handshake at the TLS layer before any HTTP response — whole branches lock out instantly. Trust anchors (root, intermediate) propagate BEFORE the leafs that chain to them.
 - **Server-cert rotation has a propagation gap** — no cluster-side auto-renew; re-run `bootstrap-secrets.sh`/`deploy-server-cert.sh` per cluster.
+- **Never run `issue-server-cert.sh` for a non-gateway cert.** It is built for THE gateway's multi-SAN cert: it stages straight into `/etc/ssl/mjbl/{service.key,fullchain.crt}` (the live serving cert) and expects the *full* gateway SAN list — issuing one unrelated FQDN with it overwrites the gateway cert and breaks the gateway on the next `deploy-server-cert.sh`. For any standalone internal service use **`scripts/issue-standalone-server-cert.sh`** (writes only to `--out`, never propagates, never mutates a role; `--csr` keeps the key off the CA). Pair it with a **dedicated `mjbl-internal-server-role`** so the gateway's `mjbl-platform-role` is never touched.
 - **Heredoc-indent / `!`-paste hazard from this runner:** feeding scripts to the CA host via interactive `!` can indent heredoc delimiters and break them, and once caused 3 accidental cert signs. Feed scripts via `ssh ca 'sudo -n bash -s' < file`.
 - **Vault 2.0 quirks** (prod host is on the 20.04/Vault-2.0 build): import via `pki/issuers/import/bundle` (not `pki/config/ca pem_bundle=`); role `default_ttl` ignored (use `ttl`); HashiCorp `focal` apt repo empty (use `jammy` codename). See the internal-ca skill G2–G6.
 - **Gateway is firewalled off the CA host (DMZ↔internal).** Any "let the gateway reach the CA/OCSP/Vault directly" plan hits this wall — it's the reason for the pull-based CRL + `:8888`.

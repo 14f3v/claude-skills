@@ -7,14 +7,14 @@
   },
   "metadata": {
     "description": "Personal user-scope Claude Code skills: internal-ca (2-tier PKI bootstrap), mtls (server-trusts-client mTLS), lxd-claude-setup (headless Claude Code setup on LXD/Linux), a bare-metal Kubernetes family — k8s-bare-metal (kubeadm + Rancher, single-node/HA/join), harbor-registry (private Harbor with self-signed CA), cicd-platform (Argo CD + self-hosted Actions runners) — and the MJBL mTLS platform suite (live deployed ecosystem on this host: platform/ca/enrollment/client/cert-lifecycle/operator-portal/troubleshooting, indexing the /home/mjbl/* runbooks).",
-    "version": "0.3.0"
+    "version": "0.3.1"
   },
   "plugins": [
     {
       "name": "claude-skills",
       "source": "./",
-      "description": "Bundled PKI + ops + bare-metal Kubernetes skills (/k8s-setup, /harbor-setup, /cicd-setup) PLUS the MJBL mTLS platform suite under /mjbl:mtls:* (platform, ca, enroll, client, cert, portal, troubleshoot) — operational skills for the live MJBL mTLS ecosystem that index the /home/mjbl/* runbooks as source-of-truth. Battle-tested runbooks with frontmatter triggers so Claude Code can auto-activate them.",
-      "version": "0.3.0",
+      "description": "Bundled PKI + ops + bare-metal Kubernetes skills (/k8s-setup, /harbor-setup, /cicd-setup) PLUS the MJBL mTLS platform suite under /mjbl:mtls:* (platform, ca, enroll, client, cert, portal, troubleshoot, issue-server) — operational skills for the live MJBL mTLS ecosystem that index the /home/mjbl/* runbooks as source-of-truth. Battle-tested runbooks with frontmatter triggers so Claude Code can auto-activate them.",
+      "version": "0.3.1",
       "author": {
         "name": "Khemphet SOUVANNAPHASY"
       },
