@@ -13,7 +13,7 @@
     {
       "name": "claude-skills",
       "source": "./",
-      "description": "Bundled PKI + ops + bare-metal Kubernetes skills (/k8s-setup, /harbor-setup, /cicd-setup) PLUS the MJBL mTLS platform suite under /mjbl:mtls:* (platform, ca, enroll, client, cert, portal, troubleshoot) — operational skills for the live MJBL mTLS ecosystem that index the /home/mjbl/* runbooks as source-of-truth. Battle-tested runbooks with frontmatter triggers so Claude Code can auto-activate them. PLUS the MJBL Kubernetes estate suite under /mjbl:k8s:* (platform, prod, facility, dr) — the prod rkek8s / facility-ArgoCD / UAT / DR multi-cluster topology, kubeconfigs, MetalLB, ArgoCD external-cluster deploys, and kubectl-apply DR tooling.",
+      "description": "Bundled PKI + ops + bare-metal Kubernetes skills (/k8s-setup, /harbor-setup, /cicd-setup) PLUS the MJBL mTLS platform suite under /mjbl:mtls:* (platform, ca, enroll, client, cert, portal, troubleshoot, issue-server) — operational skills for the live MJBL mTLS ecosystem that index the /home/mjbl/* runbooks as source-of-truth. Battle-tested runbooks with frontmatter triggers so Claude Code can auto-activate them. PLUS the MJBL Kubernetes estate suite under /mjbl:k8s:* (platform, prod, facility, dr) — the prod rkek8s / facility-ArgoCD / UAT / DR multi-cluster topology, kubeconfigs, MetalLB, ArgoCD external-cluster deploys, and kubectl-apply DR tooling.",
       "version": "0.4.0",
       "author": {
         "name": "Khemphet SOUVANNAPHASY"
