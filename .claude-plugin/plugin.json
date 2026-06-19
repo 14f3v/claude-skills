@@ -1,12 +1,12 @@
 {
   "name": "claude-skills",
-  "description": "Personal user-scope Claude Code skills. PKI/ops runbooks: internal-ca (2-tier PKI bootstrap with Vault, OCSP, CRL, Ansible deploy), mtls (server-trusts-client mutual TLS on top of internal-ca), lxd-claude-setup (provision Claude Code on a headless LXD/Linux server). Bare-metal Kubernetes family: k8s-bare-metal (kubeadm + Calico + Longhorn + Rancher, single-node/HA/join, checkpoint-resume), harbor-registry (private Harbor registry with self-signed CA), cicd-platform (Argo CD + self-hosted GitHub Actions runners). MJBL mTLS platform suite (the live deployed ecosystem on this host, indexing the /home/mjbl/* runbooks as source-of-truth): mjbl-mtls-platform, mjbl-ca-operations, mjbl-enrollment-plane, mjbl-client-provisioning, mjbl-cert-lifecycle, mjbl-operator-portal, mjbl-mtls-troubleshooting. Slash commands: /k8s-setup, /harbor-setup, /cicd-setup, and the MJBL suite under /mjbl:mtls:* (platform, ca, enroll, client, cert, portal, troubleshoot).",
-  "version": "0.3.0",
+  "description": "Personal user-scope Claude Code skills. PKI/ops runbooks: internal-ca (2-tier PKI bootstrap with Vault, OCSP, CRL, Ansible deploy), mtls (server-trusts-client mutual TLS on top of internal-ca), lxd-claude-setup (provision Claude Code on a headless LXD/Linux server). Bare-metal Kubernetes family: k8s-bare-metal (kubeadm + Calico + Longhorn + Rancher, single-node/HA/join, checkpoint-resume), harbor-registry (private Harbor registry with self-signed CA), cicd-platform (Argo CD + self-hosted GitHub Actions runners). MJBL mTLS platform suite (the live deployed ecosystem on this host, indexing the /home/mjbl/* runbooks as source-of-truth): mjbl-mtls-platform, mjbl-ca-operations, mjbl-enrollment-plane, mjbl-client-provisioning, mjbl-cert-lifecycle, mjbl-operator-portal, mjbl-mtls-troubleshooting. Slash commands: /k8s-setup, /harbor-setup, /cicd-setup, and the MJBL suite under /mjbl:mtls:* (platform, ca, enroll, client, cert, portal, troubleshoot). MJBL Kubernetes estate suite (the live multi-cluster topology — production rkek8s, the facility/ArgoCD cluster, UAT, and DR — kubeconfigs, MetalLB, ArgoCD external-cluster deploys, and the kubectl-apply DR tooling): mjbl-k8s-platform, mjbl-k8s-production, mjbl-k8s-facility, mjbl-k8s-dr, under /mjbl:k8s:* (platform, prod, facility, dr).",
+  "version": "0.4.0",
   "author": {
     "name": "Khemphet SOUVANNAPHASY"
   },
   "license": "MIT",
-  "keywords": ["pki", "tls", "mtls", "ca", "vault", "nginx", "lxd", "claude-code", "runbook", "kubernetes", "k8s", "kubeadm", "rancher", "harbor", "argocd", "helm", "bare-metal", "mjbl", "enrollment", "signer", "relay", "revocation"],
+  "keywords": ["pki", "tls", "mtls", "ca", "vault", "nginx", "lxd", "claude-code", "runbook", "kubernetes", "k8s", "kubeadm", "rancher", "harbor", "argocd", "helm", "bare-metal", "mjbl", "enrollment", "signer", "relay", "revocation", "rkek8s", "metallb", "facility", "dr", "disaster-recovery", "multi-cluster"],
   "skills": [
     "./skills/internal-ca",
     "./skills/mtls",
@@ -20,6 +20,10 @@
     "./skills/mjbl-client-provisioning",
     "./skills/mjbl-cert-lifecycle",
     "./skills/mjbl-operator-portal",
-    "./skills/mjbl-mtls-troubleshooting"
+    "./skills/mjbl-mtls-troubleshooting",
+    "./skills/mjbl-k8s-platform",
+    "./skills/mjbl-k8s-production",
+    "./skills/mjbl-k8s-facility",
+    "./skills/mjbl-k8s-dr"
   ]
 }
