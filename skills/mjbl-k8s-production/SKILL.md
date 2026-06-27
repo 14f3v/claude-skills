@@ -1,7 +1,7 @@
 ---
 name: mjbl-k8s-production
 description: This skill should be used when the user asks to operate, inspect, or deploy on the MJBL PRODUCTION Kubernetes cluster (rkek8s) — "check prod pods/services", "what's on the prod cluster", "the prod MetalLB pool / LoadBalancer IPs", "expose a service on prod via MetalLB", "reach prod from the office network / jump to a prod node", "prod nodes / control plane", "which prod IP is free", or any production-cluster (10.88.x) operation. Covers the rkek8s node/network/MetalLB/ingress layout, the kubeconfig + jump access, and how workloads land on prod (ArgoCD from the facility cluster).
-version: 0.1.0
+version: 0.1.1
 ---
 
 # MJBL Production Cluster (`rkek8s`)
@@ -30,6 +30,8 @@ kubectl get nodes -o wide
 | `mjbl-k8s-n04` | worker | `10.88.1.26` |
 
 API (ArgoCD destination + kubeconfig server): `https://rkek8s.vte.mjblao.local:6443`.
+
+**etcd HA (unlike facility):** 3 control-plane nodes = **3 etcd members → quorum 2 → tolerates ONE node failure** with no control-plane outage (contrast the facility cluster's fragile 2-node etcd, where any single node down = total outage). Storage is **Longhorn**; with 4 nodes the default 3-replica SC schedules fine here (whereas facility, at 2 nodes, must use `longhorn-2replicas`). For the cluster-agnostic recovery playbooks — node-down behavior, post-reboot sanitize (NodeLost pods / stuck `VolumeAttachment`), the **Longhorn `degraded` replica-count-vs-nodes** fix, and the **ArgoCD `Replace=true` OutOfSync** fix — see `mjbl-k8s-facility` (they apply on any cluster).
 
 ## MetalLB — the L4 entry plane
 Pool **`default-pool` = `10.88.101.140 – 10.88.101.189`** (ns `metallb-system`, auto-assign on). Pin a specific IP with the modern annotation:

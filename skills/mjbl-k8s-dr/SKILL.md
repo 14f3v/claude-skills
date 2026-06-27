@@ -1,7 +1,7 @@
 ---
 name: mjbl-k8s-dr
 description: This skill should be used when the user asks to operate the MJBL DISASTER-RECOVERY (DR) Kubernetes cluster — "the DR cluster / dr-k8s-n1 / 10.99.1.160 / drk8s.vte.mjblao.local", "is DR a replica/standby of prod", "deploy / sync a service (gold-price, microloan) to DR", "DR transforms (LoadBalancer→NodePort, longhorn→local-path, registry rewrite)", "the DR CA / dr-ca-issuer / *.dr.vte.mjblao.local", "DR prerequisites (cert-manager, metrics-server, DNS)", "why no Rancher/ArgoCD/Harbor on DR", "manage DR from the Mac", or DR cluster faults ("etcd slow / ImagePullBackOff / Calico Unauthorized / expired SA token"). DR is a SINGLE-NODE, standalone, lean cluster deployed by plain `kubectl apply` (NOT GitOps/ArgoCD), isolated and firewalled from the prod/DC network.
-version: 0.1.0
+version: 0.1.1
 ---
 
 # MJBL Disaster-Recovery Cluster
@@ -13,6 +13,7 @@ Provisioned 2026-06-16 via the [[k8s-bare-metal]] `k8s-single-node-cluster-setup
 - **Harbor and ArgoCD/Fleet are intentionally OUT OF SCOPE on DR — do not propose them.** Manage DR directly with **`kubectl` / `helm`**.
 - **Ingress is `hostNetwork` on `10.99.1.160`** (no MetalLB). DNS `*.dr.vte.mjblao.local` → `10.99.1.160`.
 - **Self-managed — do NOT import into the DC Rancher** (`rkek8s.vte.mjblao.local`); the DR→DC firewall silently drops it. Attempted + abandoned 2026-06-16.
+- **Single etcd member by design** (1 node) — no quorum games, but also **no HA**: a node/disk fault = full outage (accepted for a DR target; recover by fixing the node, see faults below). This is the same node-count-vs-redundancy principle that bites elsewhere — a **2-node** etcd is actually the *worst* spot (zero fault tolerance; see `mjbl-k8s-facility`), and Longhorn replica count must match node count (why DR uses single-replica `local-path`, not Longhorn).
 - Namespaces: `default kube-system kube-node-lease kube-public ingress-nginx local-path-storage` (+ deployed app ns).
 
 ## Access (DR work happens from the Mac, not this ops box)
