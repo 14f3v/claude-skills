@@ -38,11 +38,16 @@ A native Rancher node driver (docker-machine/rancher-machine plugin) that clones
 4. **Consequence:** apiserver writes (lease renewals, `timeout=5s`) intermittently exceed 5s → every controller loses its lease and crash-loops: `kube-controller-manager` (~749 restarts), `kube-scheduler` (~707), `kube-apiserver` (~188), Rancher's `capi-controller-manager` (~267) — all logging `leaderelection lost` / `context deadline exceeded` to `10.10.110.10:6443`. While they're down, machine reconcile stalls → new nodes never report `status.ready`/register → planner `waiting for viable init node` → rolls them → **create/delete churn**. A node succeeds only when it catches a healthy window.
 5. **Vicious cycle:** the driver clones into the SAME local-lvm/sda spindle etcd uses, so provisioning I/O starves etcd fsync → churn worsens. Concurrent clones also hit PVE storage-lock timeouts (`can't lock file '/var/lock/pve-manager/pve-storage-local-lvm' - got timeout`); the driver retries.
 
-### Fix priority (mostly infra, out of the driver's hands)
-1. **RAID write-back cache (biggest no-new-hardware win):** sda is `write through`. If the MegaRAID 5350-8i has a healthy BBU/CacheVault, set the VD cache policy to **WriteBack** → etcd fsync ~19ms→~1ms. Check with `storcli64 /c0/vall show all` + `/c0/bbu show all` (storcli NOT installed on pve01 — install it or use the RAID BIOS). If no/failed BBU, write-through is a safety default — don't override; add a BBU or an SSD.
-2. **Put etcd on SSD/NVMe** (add a disk to pve01; move k8s01-03 or at least the etcd data dir there).
+### The RAID controller is CACHELESS — write-back is impossible
+pve01's RAID controller is a **Lenovo ThinkSystem RAID 5350-8i** (`lspci` → Adaptec Smart Storage PQI `9005:028f`, subsystem `1d49:0520`, driver `smartpqi`; the CLI would be `arcconf`, NOT storcli). Per Lenovo's product guide it is an **entry-level cacheless adapter** (Adaptec PM8222 SmartIOC 2100 — **no cache memory, no supercapacitor**). So the `write through` we see is NOT a changeable policy — there is no cache to write back to. **Do not chase a "write-back" fix; it cannot exist on this hardware.**
+
+### Fix priority (infra — the ONLY real fix is faster storage)
+1. **Add an SSD/NVMe to pve01 and put etcd on it (THE fix):**
+   - Best: an **NVMe** (M.2/PCIe slot) — bypasses the RAID controller entirely.
+   - Cheapest: a **SATA SSD on a free onboard AHCI port** — pve01's motherboard has 8 AHCI SATA ports (`host0-7`) that are currently EMPTY (all 3 disks sda/sdb/sdc are on the `smartpqi` controller `host8`); a SATA SSD there bypasses the cacheless RAID controller and gives etcd low-latency fsync.
+   - Then move the k8s01-03 etcd data (or the whole control-plane VM disks) onto it.
+2. **No-hardware band-aid — raise timeouts so the slow disk stops crash-looping the control plane** (reduces churn, does NOT make etcd healthy): bump etcd `--heartbeat-interval`/`--election-timeout` in `/etc/kubernetes/manifests/etcd.yaml` and the leader-election `--leader-elect-lease-duration`/`--leader-elect-renew-deadline`/`--leader-elect-retry-period` in the kube-controller-manager & kube-scheduler manifests on k8s01-03. Edit static-pod manifests carefully (a bad edit stalls the apiserver). Keep churn/load low too (never delete the last etcd; driver clone-retry already hardened in v0.1.1).
 3. **Restore etcd HA to 3 members** — but only AFTER the disk is fast (3 slow members won't help).
-4. **Cut clone I/O contention** — driver-side clone-retry hardening + don't clone onto etcd's spindle.
 
 ### Quick triage commands
 ```bash
