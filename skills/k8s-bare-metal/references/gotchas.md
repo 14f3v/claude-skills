@@ -1,6 +1,6 @@
 # k8s-bare-metal — full gotcha catalog
 
-The complete set of hard-won, known-bad-pattern-avoided idioms baked into `k8s-single-node-cluster-setup.sh` and `k8s-node-cleanup.sh`. The SKILL.md inlines the ~12 that gate a successful run; this file is the debugging reference for everything else. Each entry: the failure mode, then the exact idiom that handles it.
+The complete set of hard-won, known-bad-pattern-avoided idioms baked into the three scripts — `k8s-node-cleanup.sh` (teardown), `k8s-installation.sh` (standalone node prereqs), and `k8s-single-node-cluster-setup.sh` (the provisioner). The SKILL.md inlines the ~12 that gate a successful run; this file is the debugging reference for everything else. Each entry: the failure mode, then the exact idiom that handles it.
 
 When a phase fails, jump to the matching section. `[severity]` reflects how badly it breaks a run.
 
@@ -11,6 +11,7 @@ When a phase fails, jump to the matching section. `[severity]` reflects how badl
 - [Ingress & Rancher](#ingress--rancher)
 - [Node environment (LXC / Proxmox / arch)](#node-environment-lxc--proxmox--arch)
 - [Resume, idempotency & sudo](#resume-idempotency--sudo)
+- [Standalone k8s-installation.sh](#standalone-k8s-installationsh)
 - [Security & reproducibility](#security--reproducibility)
 - [Cleanup / reset](#cleanup--reset)
 
@@ -225,6 +226,27 @@ Phase 1 `cd /tmp` and doesn't return; later steps use absolute paths so it's cur
 
 ---
 
+## Standalone k8s-installation.sh
+
+The repo's **second** script (`k8s-installation.sh`, ~121 lines) is a thin, linear node-prereq installer (apt repos, kube{adm,let,ctl}, containerd, swap/modules/sysctl, Helm v3.16.3). It is **functionally redundant** with the provisioner's Phase 1, which re-implements it as a superset — so the provisioner alone fully preps a node. Run `k8s-installation.sh` only for a standalone prep pass (e.g. hand-prepping a join node). Its footguns differ from the provisioner's:
+
+### G-INSTALL-NOPIPEFAIL — no `set -euo pipefail`, errors are swallowed `[high]`
+Unlike the provisioner (`set -euo pipefail`), `k8s-installation.sh` has **no error handling at all**. A failed k8s-repo add, gpg dearmor, `apt install`, or `modprobe` is ignored and the script presses on — a "successful"-looking run can leave a **half-prepped node** (e.g. no containerd, or kube packages missing). Verify after: `command -v kubeadm containerd helm` and `containerd config dump | grep SystemdCgroup`.
+
+### G-INSTALL-FSTAB — unguarded `sed -i '/swap/d' /etc/fstab` `[medium]`
+`k8s-installation.sh` (line 42) deletes **every** `/etc/fstab` line containing the substring `swap` — including comments or unrelated mounts with "swap" in the path — with no `/swap/` pre-grep guard (the provisioner's LXC path is gentler, G-LXC-SWAP). Destructive and non-idempotent (re-runs keep mangling fstab); cleanup does **not** restore it.
+
+### G-INSTALL-KEYRING — assumes `/etc/apt/keyrings` exists `[medium]`
+`k8s-installation.sh` writes the k8s keyring to `/etc/apt/keyrings/...` **without** `mkdir -p /etc/apt/keyrings` first (the provisioner does this). On a host lacking that dir the `gpg --dearmor` fails — silently, because there's no pipefail — and the subsequent `apt install kubeadm` then has no repo. If kube packages "won't install," check the dir/keyring exist.
+
+### G-INSTALL-DOCKER-SUITE — Docker repo keyed to `$(lsb_release -cs)` `[medium]`
+The Docker `containerd.io` repo line uses the host's Ubuntu codename. On a brand-new Ubuntu release Docker hasn't published yet, `apt install containerd.io` fails — and (no pipefail) the script marches on **without a container runtime**. Same hazard exists in the provisioner's Phase 1; pin/override the suite if on a bleeding-edge release.
+
+### G-INSTALL-NOCHECKSUM — Helm download is unverified `[low]`
+Both this script and the provisioner `wget` the Helm tarball and `tar -zxvf` with no checksum/signature check. Acceptable for lab; for prod, verify the published SHA256.
+
+---
+
 ## Security & reproducibility
 
 ### G-PIN — floating versions break previously-working runs `[high]`
@@ -244,6 +266,19 @@ PostgreSQL/Rancher use literal `rancher` / `rancher#2025` / `rancherdb`, passed 
 ---
 
 ## Cleanup / reset
+
+### G-CHECKPOINT-WIPE — cleanup does NOT remove the provisioner checkpoint `[critical]`
+The headline cleanup footgun, confirmed in production. `k8s-node-cleanup.sh` deletes `/var/lib/{kubelet,etcd,cni,containerd,longhorn}`, `/etc/kubernetes`, `/etc/containerd`, the apt repos/keyrings, and sweeps CNI interfaces — but it **never touches `/var/lib/k8s-setup`** (grep the whole script: its only `k8s-setup` reference is the **log** dir `/var/log/k8s-setup`). The provisioner records each finished phase there (`CHECKPOINT_FILE=/var/lib/k8s-setup/checkpoint_state`, matched whole-line via `grep -qFx`, see [G-CHECKPOINT](#g-checkpoint--exact-line-resume-gating)). So:
+
+> **cleanup → re-run setup** (without clearing the checkpoint) makes the provisioner report **every** phase `SKIPPED - Already Complete` and **deploy nothing** — on a node whose packages cleanup just purged. The node looks wiped but the checkpoint says "done."
+
+This is the #1 "I ran cleanup and rebuilt but nothing came up" cause. The fix is one line, and it is **mandatory** in any cleanup→reprovision runbook:
+```bash
+sudo bash k8s-node-cleanup.sh -y
+sudo rm -rf /var/lib/k8s-setup          # ← cleanup leaves this; clear it or setup skips everything
+sudo bash k8s-single-node-cluster-setup.sh <flags> -y
+```
+(Running `k8s-installation.sh` in between does **not** help — it reinstalls packages but the provisioner still skips its cluster phases on the stale checkpoint.) Hardening: have `k8s-node-cleanup.sh` `rm -rf /var/lib/k8s-setup` itself.
 
 ### G-CLEAN-PARTIAL — tolerate partially-installed state `[high]`
 A reset may hit a node missing kubeadm/containerd/CNI; under `set -euo pipefail` the first missing thing aborts cleanup midway. Every destructive op is guarded:

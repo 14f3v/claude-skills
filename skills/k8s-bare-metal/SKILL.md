@@ -1,7 +1,7 @@
 ---
 name: k8s-bare-metal
-description: This skill should be used when the user asks to "set up / bootstrap / provision a bare-metal (or on-prem / Proxmox / LXC) Kubernetes cluster", "stand up a single-node k8s cluster with Rancher", "install kubeadm + Calico + Longhorn + Rancher", "set up an HA control-plane node", "join a worker or control-plane node to my cluster", "resume a failed k8s setup", or "reset / clean up / tear down a Kubernetes node". Orchestrates the battle-tested `k8s-single-node-cluster-setup.sh` provisioner (and `k8s-node-cleanup.sh`): kubeadm v1.31 + Calico + Longhorn + metrics-server + cert-manager + optional MetalLB + PostgreSQL + Rancher + ingress-nginx, with checkpoint/resume, LXC-safe node prep, and single-node / HA / join modes. Use it whenever the user wants a working Rancher-managed Kubernetes cluster on their own hardware, even if they don't name the script. Hands off to [[harbor-registry]] for a private registry and [[cicd-platform]] for Argo CD + GitHub Actions runners.
-version: 0.1.0
+description: This skill should be used when the user asks to "set up / bootstrap / provision a bare-metal (or on-prem / Proxmox / LXC) Kubernetes cluster", "stand up a single-node k8s cluster with Rancher", "install kubeadm + Calico + Longhorn + Rancher", "set up an HA control-plane node", "join a worker or control-plane node to my cluster", "resume a failed k8s setup", or "reset / clean up / tear down a Kubernetes node". Orchestrates the battle-tested 3-script workflow — `k8s-node-cleanup.sh` (teardown), `k8s-installation.sh` (standalone node prereqs), and the `k8s-single-node-cluster-setup.sh` provisioner: kubeadm v1.31 + Calico + Longhorn + metrics-server + cert-manager + optional MetalLB + PostgreSQL + Rancher + ingress-nginx, with checkpoint/resume, LXC-safe node prep, and single-node / HA / join modes. Use it whenever the user wants a working Rancher-managed Kubernetes cluster on their own hardware, even if they don't name the scripts. Hands off to [[harbor-registry]] for a private registry and [[cicd-platform]] for Argo CD + GitHub Actions runners.
+version: 0.2.0
 ---
 
 # k8s-bare-metal — kubeadm + Rancher cluster bootstrap
@@ -14,11 +14,29 @@ This is the entry-point skill for the bare-metal stack. After the cluster is up,
 
 ---
 
-## Where the script lives (prefer local, fall back to URL)
+## The 3-script workflow
 
-The automation is one script: **`k8s-single-node-cluster-setup.sh`** (plus `k8s-node-cleanup.sh` for teardown). All modes are flags on that one script.
+The repo (`scripts/k8s-bare-metal/`) ships **three** scripts. A fresh build (or rebuild) runs them in order:
 
-1. **Prefer a local `script-helper` checkout** if one is reachable (e.g. the user has the repo, or you cloned it). Run it directly:
+| Step | Script | Role | Notes |
+|---|---|---|---|
+| 1 | **`k8s-node-cleanup.sh -y`** | Teardown / reset to pre-Kubernetes state | Only when re-provisioning an existing node. `-y` also wipes Longhorn data. |
+| 2 | **`k8s-installation.sh`** | Standalone node prereqs (apt repos, kube{adm,let,ctl}, containerd, Helm v3.16.3, swap/modules/sysctl) | **Optional / redundant** — the provisioner's Phase 1 does the *same* work as a **superset** (adds `conntrack ebtables socat ipset` + LXC-safe guards). The provisioner alone fully preps the node. Run this only for a standalone prep pass. ⚠️ It has **no `set -euo pipefail`** (errors are swallowed) and is non-idempotent (re-running re-mangles `/etc/fstab`). |
+| 3 | **`k8s-single-node-cluster-setup.sh <flags>`** | The provisioner | **All cluster modes are flags on this script** (single-node / HA / join, MetalLB or not). Checkpoint/resumable. |
+
+```bash
+# canonical rebuild on an existing node:
+sudo bash k8s-node-cleanup.sh -y
+sudo rm -rf /var/lib/k8s-setup          # ← MANDATORY after cleanup (see footgun below)
+sudo bash k8s-installation.sh           # optional — Phase 1 of the provisioner does this too
+sudo bash k8s-single-node-cluster-setup.sh --hostname H --ingressip IP [--ha --endpoint LB:6443 …] -y
+```
+
+> ⚠️ **Rebuild footgun (the #1 "nothing deploys" cause).** `k8s-node-cleanup.sh` wipes the cluster but does **NOT** remove the provisioner's checkpoint at `/var/lib/k8s-setup`. After a cleanup, a fresh provisioner run finds the stale `checkpoint_state` and reports **every** phase *"SKIPPED — Already Complete"* — so it deploys nothing (and doesn't even re-prep the node, despite cleanup having purged the packages). **You must `sudo rm -rf /var/lib/k8s-setup` between cleanup and the provisioner.** See [G-CHECKPOINT-WIPE](references/gotchas.md).
+
+### Where the scripts live (prefer local, fall back to URL)
+
+1. **Prefer a local `script-helper` checkout** if reachable. All three live under `scripts/k8s-bare-metal/`:
    ```bash
    sudo bash <repo>/scripts/k8s-bare-metal/k8s-single-node-cluster-setup.sh <flags>
    ```
@@ -27,8 +45,9 @@ The automation is one script: **`k8s-single-node-cluster-setup.sh`** (plus `k8s-
    curl -fsSL https://raw.githubusercontent.com/phimasonelabs/script-helper/main/scripts/k8s-bare-metal/k8s-single-node-cluster-setup.sh \
      | sudo bash -s -- <flags>
    ```
+   (swap the filename for `k8s-node-cleanup.sh` / `k8s-installation.sh` as needed — same path.)
 
-The checkpoint lives **on the target host** (`/var/lib/k8s-setup/checkpoint_state`), not in the script, so re-running either form **resumes from where it failed** — see [Recovery](#recovery--resume-on-failure). For repeated debugging on one host, download once (`curl -fsSLo /tmp/k8s-setup.sh <url>`) and re-run the local copy so you're not re-fetching each time.
+The provisioner's checkpoint lives **on the target host** (`/var/lib/k8s-setup/checkpoint_state`), not in the script, so re-running it **resumes from where it failed** *as long as the checkpoint still matches reality* — a cleanup leaves it stale (see the footgun above). For repeated debugging on one host, download once (`curl -fsSLo /tmp/k8s-setup.sh <url>`) and re-run the local copy so you're not re-fetching each time.
 
 ---
 
@@ -55,7 +74,7 @@ The checkpoint lives **on the target host** (`/var/lib/k8s-setup/checkpoint_stat
 | Join worker | `--join H:6443 --token T --discovery-token-ca-cert-hash sha256:…` | join, token, hash | Preps the node, then `kubeadm join`, then exits |
 | Join control-plane | add `--control-plane --certificate-key K` | + control-plane, certificate-key | HA secondary CP node |
 | Non-interactive | add `-y` / `--yes` / `--force` | — | Skips all confirmation prompts (use in automation) |
-| Reset / teardown | run `k8s-node-cleanup.sh` | — | See [Cleanup](#cleanup--reset). `-y` also wipes Longhorn data |
+| Reset / teardown | run `k8s-node-cleanup.sh` | — | See [Cleanup](#cleanup--reset). `-y` also wipes Longhorn data. **Then `sudo rm -rf /var/lib/k8s-setup` before any re-provision** (cleanup leaves the checkpoint) |
 
 After a successful first-node run, the script prints the **worker and control-plane join commands** (and how to recall the certificate-key and mint a fresh token). Capture those to add nodes later.
 
@@ -67,7 +86,7 @@ Full single-node run is **10 phases** (9 without MetalLB, 2 in join mode). Each 
 
 | # | Phase | Installs | Verify gate |
 |---|---|---|---|
-| 1 | Node prep | k8s v1.31 repo, containerd.io, kube{adm,let,ctl}, Helm **v3.16.3**, swap off, modules, sysctl | `helm version` ok; containerd active; `SystemdCgroup=true` |
+| 1 | Node prep † | k8s v1.31 repo, containerd.io, kube{adm,let,ctl}, Helm **v3.16.3**, base tools (`conntrack ebtables socat ipset` …), swap off, modules, sysctl | `helm version` ok; containerd active; `SystemdCgroup=true` |
 | 2 | Control-plane init | `kubeadm init` (+`--control-plane-endpoint`/`--upload-certs` in HA) | `kubectl get nodes` Ready; taint removed; kubeconfig for root **and** sudo user |
 | 3 | Calico CNI | Calico **v3.27.0** manifest (non-operator `calico.yaml` → pods land in `kube-system`) | manifest applied (⚠️ **no scripted wait** in Phase 3); CoreDNS/Calico pods go Ready shortly after |
 | 4 | Longhorn | Longhorn **1.7.2** (helm, `--timeout 15m`) | `longhorn` StorageClass exists (⚠️ script just `sleep 30`s — see G-SLEEP) |
@@ -78,6 +97,8 @@ Full single-node run is **10 phases** (9 without MetalLB, 2 in join mode). Each 
 | 9 | Rancher | rancher-latest ⚠️ (external DB, `replicas=1`) | rancher deployment up; ingress object created |
 | 10 | ingress-nginx | baremetal manifest from `main` ⚠️ → hostNetwork patch; LB IP if MetalLB | controller `readyReplicas==spec.replicas`; Rancher ingress annotated |
 
+**†** Phase 1 is the **same node prep** that the standalone `k8s-installation.sh` does — the provisioner's version is a **superset** (extra base tools + LXC-safe `swapoff`/`modprobe`/`sysctl` guards + `mkdir -p /etc/apt/keyrings`). So the provisioner self-preps; `k8s-installation.sh` is only needed for a standalone prep pass (e.g. prepping a join node by hand). Don't run `k8s-installation.sh` expecting it to deploy anything — it stops at "node ready."
+
 Don't advance past a failing gate — the script's `set -euo pipefail` + checkpoint design means you fix, then re-run to resume.
 
 ---
@@ -87,7 +108,7 @@ Don't advance past a failing gate — the script's `set -euo pipefail` + checkpo
 ```
 /var/log/k8s-setup/k8s-setup-<YYYYMMDD-HHMMSS>.log   ← full setup log (tee'd)
 /var/log/k8s-setup/k8s-cleanup-<…>.log                ← cleanup log
-/var/lib/k8s-setup/checkpoint_state                   ← resume checkpoint (one phase phrase per line)
+/var/lib/k8s-setup/checkpoint_state                   ← resume checkpoint (one phase phrase per line) — ⚠️ SURVIVES k8s-node-cleanup.sh; rm -rf manually before re-provision
 /etc/apt/keyrings/kubernetes-apt-keyring.gpg          ← k8s v1.31 repo key
 /usr/share/keyrings/docker-archive-keyring.gpg        ← Docker repo key (for containerd.io)
 /etc/containerd/config.toml                           ← SystemdCgroup=true
@@ -151,9 +172,11 @@ The script is built to be re-run. When a phase fails:
 2. **Inspect the log** at `/var/log/k8s-setup/k8s-setup-*.log` (the most recent timestamp).
 3. **Fix the root cause** (use the matching gotcha — most failures are G-PIN, G-LXC, DNS, or a not-yet-ready add-on).
 4. **Re-run the exact same command.** Completed phases are skipped via the checkpoint (`grep -qFx` whole-line match in `/var/lib/k8s-setup/checkpoint_state`), so it picks up at the failed phase. `kubeadm init` is **not** idempotent, so never delete the checkpoint and re-run on a half-initialized node — reset first (below).
-5. **If state is corrupted** (half-init, wrong flags baked into certs): run cleanup, then start fresh.
+5. **If state is corrupted** (half-init, wrong flags baked into certs): run cleanup, **then `sudo rm -rf /var/lib/k8s-setup`**, then start fresh. Cleanup does **not** clear the checkpoint, so skipping this `rm` makes the fresh provisioner run skip every phase — see below.
 
-To force a clean re-run of one phase, remove its exact line from the checkpoint file (e.g. `sed -i '/^Phase 5: Setup Metrics Server$/d' /var/lib/k8s-setup/checkpoint_state`).
+> ⚠️ **G-CHECKPOINT-WIPE.** `k8s-node-cleanup.sh` never removes `/var/lib/k8s-setup`. If you "cleanup then re-run setup" **without** `rm -rf /var/lib/k8s-setup`, the surviving `checkpoint_state` makes the provisioner report every phase *"SKIPPED — Already Complete"* and **nothing deploys** on the wiped node. This is the single most common rebuild failure. Always clear the checkpoint dir after a cleanup.
+
+To force a clean re-run of **one** phase, remove its exact line from the checkpoint file (e.g. `sed -i '/^Phase 5: Setup Metrics Server$/d' /var/lib/k8s-setup/checkpoint_state`). To force a full clean re-run, `rm -rf /var/lib/k8s-setup`.
 
 ---
 
@@ -169,6 +192,8 @@ sudo bash k8s-node-cleanup.sh -y
 ```
 
 **Never pass `-y` on a node whose Longhorn data matters** (G-LONGHORN-WIPE). After cleanup, a reboot is recommended before re-provisioning.
+
+> ⚠️ **Cleanup does NOT remove the provisioner checkpoint `/var/lib/k8s-setup`** (it wipes `/var/lib/{kubelet,etcd,cni,containerd,longhorn}` and `/etc/kubernetes`, but not the checkpoint dir). Before you re-provision, run **`sudo rm -rf /var/lib/k8s-setup`** — otherwise the provisioner skips every phase and nothing deploys (G-CHECKPOINT-WIPE).
 
 ---
 
