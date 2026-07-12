@@ -111,6 +111,41 @@ After this, `claude` launches straight into the TUI. No re-auth needed.
 
 ---
 
+## Step 5 — Refresh Expired Credentials (recurring)
+
+OAuth tokens expire after a few days. The catch: `claude auth status` keeps reporting `loggedIn: true` because it only reads the stored credentials file — it does **not** validate the token. The failure only shows up on a real request:
+
+```bash
+claude -p "reply AUTH_OK"
+# API Error: 401 {"type":"authentication_error","message":"Invalid authentication credentials"}
+```
+
+**Always verify with a live prompt, not just `auth status`.**
+
+Re-login uses the **paste-code** flow: `claude auth login --claudeai` opens a URL that (on 2.1.128) redirects to `platform.claude.com/oauth/code/callback` and shows a code to paste back. The process blocks on stdin waiting for that code.
+
+To drive it non-interactively / over a background SSH session (stdin isn't directly writable), feed the code via a file:
+
+```bash
+# 1. Start login in background, fed by a code file that doesn't exist yet
+( while [ ! -s code.txt ]; do sleep 1; done; head -1 code.txt ) \
+  | ssh -L 54545:localhost:54545 USER@HOST 'claude auth login --claudeai' > oauth.log 2>&1 &
+
+# 2. Grab the URL, open it in your local browser, sign in
+grep -o 'https://claude.com/cai/oauth/authorize[^ ]*' oauth.log
+
+# 3. Paste the returned code (format: <code>#<state>) into the code file
+printf '%s\n' '<pasted-code>' > code.txt   # process consumes it -> "Login successful."
+
+# 4. Verify it actually works, then remove the one-time code
+ssh USER@HOST 'claude -p "reply AUTH_OK"'
+rm -f code.txt
+```
+
+> The `-L 54545` tunnel isn't strictly required for the paste-code flow, but it's harmless and keeps parity with older callback-based versions.
+
+---
+
 ## Key Files on the Remote Host
 
 | File | Purpose |
@@ -130,3 +165,4 @@ After this, `claude` launches straight into the TUI. No re-auth needed.
 | TUI loops on login screen | Missing `hasCompletedOnboarding` in `~/.claude.json` | Add flag via python3 snippet above |
 | `claude -p` works but TUI doesn't | Credentials saved but onboarding not marked complete | Same fix as above |
 | OAuth callback fails on headless | No browser on server | Use `ssh -L 54545:localhost:54545` tunnel |
+| `auth status` says logged-in but `claude -p` returns 401 | Stored token expired; status doesn't validate it | Re-login via Step 5 paste-code flow |
