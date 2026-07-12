@@ -1,5 +1,5 @@
 ---
-name: wealthcorp-rancher-provisioning
+name: wealthcorp-rancher-proxmox
 description: This skill should be used when the user asks to operate or troubleshoot the WEALTHCORP Rancher-on-Proxmox node provisioning environment — "provision / scale an RKE2 cluster on Proxmox / pve01 from Rancher", "the pvenode node driver", "the wealth-cluster / wealthcorp Rancher (rkek8s.wealthcorp.la)", "reach pve01 / k8s01-03 / 10.10.110.x / 10.10.8.200", "why is node provisioning flaky / looping create-delete / churning", "nodes NotReady / Calico crash / etcd slow / controllers crash-looping on the wealth cluster", "cacerts / cert error on new nodes", or any WealthCorp Proxmox↔Rancher provisioning operation. Covers access (VPN + kubeconfig + ssh aliases), the topology (pve01, the single-host Rancher mgmt cluster, template 9000, the pvenode driver), and — most importantly — the ETCD-DISK reliability root cause that makes provisioning intermittently fail, plus the operational gotchas (never delete the last etcd node, cpu=host template, cacerts fix, credential attach).
 version: 0.1.0
 ---
