@@ -25,7 +25,7 @@ version: 0.1.0
 | **Production (`rkek8s`)** | live prod (mTLS platform, microloan, lapnet, gold-price prod…) | `~/.kube/mjbl-prod.config` | `mjbl-k8s-n01..n04` (`10.88.101.32/.31` + `10.88.1.27/.26`) | **ArgoCD** (from facility) → `https://rkek8s.vte.mjblao.local:6443` |
 | **Facility** | **runs ArgoCD** (`argocd.vte.mjblao.local`) + facility apps | `~/.kube/mjbl-facility.config` ⚠ needs `--tls-server-name=registry.k8sapi.local` | k8s 1.31 | self / Helm |
 | **UAT** | UAT apps (approval-form, partner-payment, gold-price uat, itprofiler-alert) | `~/.kube/config` (**default** ctx `kubernetes-admin@kubernetes`) | `mjbl-graphql-api` `192.168.1.65` (+ `mb2-uat` `.66`, `appgateway` `.61`) | **ArgoCD** (from facility) → `https://192.168.1.65:6443` |
-| **DR** | DR site — single-node **v1.31**, **standalone** (NOT a prod mirror; lean kubeadm+Calico+local-path, no Rancher/ArgoCD/Harbor) | `~/.kube/dr-config` (**on the Mac**, not the ops box) | `dr-k8s-n1` `10.99.1.160` | **`kubectl apply`** (NO GitOps) via `tools/dr/dr-deploy.sh` |
+| **DR** | DR site — single-node **v1.31**, **standalone** (NOT a prod mirror; lean kubeadm+Calico+local-path; no DC ArgoCD/Harbor, but runs its OWN **local Rancher CD**) | `~/.kube/dr-config` (**on the Mac**, not the ops box) | `dr-k8s-n1` `10.99.1.160` | **local Rancher CD (Fleet)** on DR, watching k8s-config `dr/` overlays (`kubectl apply` / `dr-deploy.sh` DEPRECATED) |
 
 **Networks:** prod = `10.88.101.x` (DMZ/MetalLB) + `10.88.1.x` (internal). UAT/facility/ops = `192.168.1.x`. DR = `10.99.1.x`. **The office/UAT LAN (`192.168.1.x`) is segmented from prod (`10.88.x`)** — you cannot reach prod IPs from `192.168.1.25` ("No route to host"); test prod from a prod-network host (see access below).
 
@@ -33,7 +33,7 @@ version: 0.1.0
 ArgoCD runs on the **facility** cluster and manages **prod** and **UAT** as **registered external clusters** — so an Application's `destination.server` is the *target* cluster's API URL, **NOT** `https://kubernetes.default.svc` (that would target facility itself):
 - prod apps → `https://rkek8s.vte.mjblao.local:6443`
 - UAT apps → `https://192.168.1.65:6443`
-- DR is **outside ArgoCD** (plain `kubectl apply`).
+- DR is **outside the facility ArgoCD** — it runs its OWN **local Rancher CD (Fleet)** on the DR cluster, watching the k8s-config `dr/` overlays.
 
 Details + how to register/sync apps live in **`mjbl-k8s-facility`**.
 
@@ -60,7 +60,7 @@ ssh khemphet-mac          # → your Mac jump
 - Real production traffic / the mTLS platform / MetalLB L4 IPs → **prod** (`mjbl-k8s-production`).
 - ArgoCD Application objects, sync/registering apps, the ArgoCD UI → **facility** (`mjbl-k8s-facility`).
 - Anything proxying to `192.168.1.61/.65/.66` or a UAT/pentest target → **UAT** (default ctx).
-- Disaster-recovery standby, `*.dr.vte.mjblao.local`, `kubectl apply` flows → **DR** (`mjbl-k8s-dr`).
+- Disaster-recovery standby, `*.dr.vte.mjblao.local`, the DR-local Rancher CD (Fleet) flow → **DR** (`mjbl-k8s-dr`).
 
 ## Related skills & docs
 - `mjbl-k8s-production` · `mjbl-k8s-facility` · `mjbl-k8s-dr` — the per-cluster operational skills.

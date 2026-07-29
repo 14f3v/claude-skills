@@ -87,7 +87,7 @@ $K patch application <app> --type=merge -p '{"operation":{"initiatedBy":{"userna
 - Facility node down → the whole API hangs (2-node etcd quorum); boot the node, don't reach for etcd surgery. See *etcd-quorum trap* above.
 - `destination.server: https://kubernetes.default.svc` in an Application → wrongly targets facility; use the prod/UAT external URL.
 - App appears "registered" but never deploys → the manifests aren't on `main` yet, or the destination/cluster isn't registered.
-- DR is **not** managed by ArgoCD — see `mjbl-k8s-dr`.
+- DR is **not** managed by the facility ArgoCD — it runs its OWN local Rancher CD (Fleet) on the DR cluster; see `mjbl-k8s-dr`.
 
 ## Related
 `mjbl-k8s-platform` (map) · `mjbl-k8s-production` (what lands on prod) · `cicd-platform` (installing ArgoCD on a fresh cluster) · memory `reference_argocd_access.md`, `reference_facility_cluster.md`.
