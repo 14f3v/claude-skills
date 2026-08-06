@@ -37,10 +37,10 @@ For *doing* work in one plane, this skill routes you — then use the focused si
 | Plane | Component | Host / location | Address / port | Notes |
 |---|---|---|---|---|
 | **Trust/PKI** | Vault PKI (Root + Intermediate, KV-v2 `enroll/`) | CA host `mjbl-ca-crl` (internal zone, airgapped) | `10.88.1.116` | Vault 2.0.1, Raft. Issuing role `pki/sign/mjbl-branch-client-role` (EC P-256, `clientAuth`, CN `<branch>.<uuid>.mjbl.internal`). AppRole `mjbl-enroll`. |
-| **Trust/PKI** | Signer | CA host | `:8444` (admin-Bearer + IP-allowlist) | `/opt/mjbl-enroll/mjbl_enroll_signer.py`, systemd `mjbl-enroll-signer`, user `mjbl-enroll`. Endpoints: `/mint /sign /revoke /devices /activity /allowlist /claim-status /healthz`. Audit `/var/log/mjbl-enrollment.log`. Auths to Vault via AppRole `mjbl-enroll` (`/opt/mjbl-enroll/approle/{role_id,secret_id}`); secret_id recovery = `mjbl-enroll-signer-vault-recover.sh` + monthly `mjbl-enroll-signer-vault-recover.timer`. |
+| **Trust/PKI** | Signer | CA host | `:8444` (admin-Bearer + IP-allowlist) | `/opt/mjbl-enroll/mjbl_enroll_signer.py`, systemd `mjbl-enroll-signer`, user `mjbl-enroll`. Endpoints: `/mint /sign /renew /revoke /devices /activity /allowlist /claim-status /healthz`. **`/renew` (2026-08-06)** is token-free: the device's CURRENT valid cert IS the credential, forwarded by the relay as base64 DER in `X-Client-Cert-DER` and **re-validated independently** by the signer (8-stage fail-closed, incl. a live Vault revocation gate). Audit `/var/log/mjbl-enrollment.log`. Auths to Vault via AppRole `mjbl-enroll` (`/opt/mjbl-enroll/approle/{role_id,secret_id}`); secret_id recovery = `mjbl-enroll-signer-vault-recover.sh` + monthly `mjbl-enroll-signer-vault-recover.timer`. |
 | **Trust/PKI** | CRL HTTP server + OCSP responder | CA host | CRL `:8888` (docroot `/opt/mjbl-demo/crl-serve`), OCSP `:2560` | Hop-2 publish timer `mjbl-crl-publish.timer` (**1 min**, intermediate-only, churn-free); `mjbl-crl-root-refresh.timer` (daily). `refresh-crl.sh` / `publish-intermediate-crl.sh`. |
 | **Access** | mTLS gateway (nginx) | cluster ns `mjbl-mtls-gateway` (rkek8s) | LB `10.88.101.142:2399` | `ssl_verify_client on`, `ssl_verify_depth 2`, `ssl_crl /etc/ssl/mjbl/crl-bundle.pem`. Injects `X-Client-CN/Serial/Verify`. CronJob `mjbl-crl-refresh` (`*/2`, sha256 change-detect → rollout). Guardrail CronJob `mjbl-revocation-selftest` (`*/5`, valid+revoked canary). |
-| **Enrollment** | Relay (LB → signer `/sign`) | cluster ns `mjbl-enroll` (rkek8s) | LB `10.88.101.143:8443`, `enroll.vte.mjblao.local` | Device→CA path; keeps the CA airgapped from the device network. |
+| **Enrollment** | Relay (LB → signer `/sign`, `/renew`) | cluster ns `mjbl-enroll` (rkek8s) | LB `10.88.101.143:8443`, `enroll.vte.mjblao.local` | Device→CA path; keeps the CA airgapped from the device network. **One listener, `verify_mode=CERT_OPTIONAL`**: `/enroll` presents NO client cert (token-authenticated), `/renew` REQUIRES one and enforces its presence **in application code**, because Python `ssl` applies `verify_mode` per socket, not per path. |
 | **Operations** | Operator portal — BFF (Bun + Hono) | cluster ns `mjbl-mtls-operator-portal` | `:8787` | **Only** component that talks the signer admin API (admin token server-side, pins root CA). `AUTH_MODE=bootstrap`\|`ldap`. RBAC + branch-scope, CSRF, `__Host-` session. |
 | **Operations** | Operator portal — Web (Vite/React + nginx) | same ns | Ingress `mtls-portal.vte.mjblao.local` | Same-origin nginx reverse-proxies `/api` → BFF. Dashboard / Devices / Enroll / Enroll-by-QR / Allowlist / Activity. `VITE_USE_MOCK=false` in prod image. |
 | **Device** | agency_v2 (Flutter/Android) | pilot tablets | — | Self-generates stable UUID, builds CSR, enrolls (token or QR), stores cert in secure storage, presents on every mTLS call; routes revoked/expired back to re-enroll. |
@@ -51,10 +51,31 @@ For *doing* work in one plane, this skill routes you — then use the focused si
 - **facility** — hosts the ArgoCD control plane (`argocd.vte.mjblao.local`).
 - **`192.168.1.65`** — UAT / the default `kubectl` context.
 
-### The three end-to-end flows
+### The four end-to-end flows
 1. **Enroll:** operator → Portal "Enroll" / "Enroll by QR" → BFF → signer `/mint` (admin) → one-time token → device (token or scans claim-QR) → relay → signer `/sign` (token + CSR) → device cert.
 2. **Access (every request):** device → mutual TLS to gateway (presents cert) → nginx verifies chain + CRL → backend, with `X-Client-CN/Serial/Verify` injected.
 3. **Revoke (the pull chain that must stay healthy):** Portal Revoke → BFF → signer `/revoke` → Vault `pki/revoke` + `pki/crl/rotate` → CA-host hop-2 timer publishes `:8888` (≤1 min) → cluster CRL CronJob fetches + rolls gateway (≤2 min) → revoked cert refused on next handshake. Self-tested every 5 min.
+
+4. **Renew (token-free, unattended — live 2026-08-06):** device notices its cert is inside the
+   **30-day window** → generates a NEW keypair + CSR → `POST /renew` over mTLS **presenting its
+   current cert as the credential** → relay verifies the peer cert, forwards base64 DER in
+   `X-Client-Cert-DER` → signer **re-validates independently** (chain → expiry/`too_early` → CN
+   split → live allowlist → **Vault revocation gate** → CSR proof-of-possession) → new 90-day cert
+   → device hot-swaps its `SecurityContext`. No operator, no token, no site visit.
+   - **The superseded cert is deliberately NOT revoked** — the device's persistence is several
+     non-atomic writes, so revoking on issue would brick any device that fails to store the new
+     one. Overlap is bounded by natural expiry (≤30d). The compensating control: revoking a device
+     by branch+uuid must revoke **every** unexpired serial.
+   - **Why the signer re-validates instead of trusting the relay:** Python's `ssl` does **no CRL or
+     OCSP check**, so a revoked-but-unexpired cert completes the relay handshake cleanly. The
+     signer's Vault revocation read is the ONLY gate stopping a revoked device from minting itself
+     a fresh cert whose serial is on no CRL — which the gateway would then accept. Get this wrong
+     and revocation is defeated platform-wide.
+   - Client policy (`agency_v2 lib/services/mtls.dart`): 30-day window, per-device jitter over
+     0–47h (FNV-1a of the UUID, so no thundering herd), daily retry with 1/2/4/8/16→24h backoff,
+     7-day cliff, one-deep identity backup so a partial write cannot brick the device.
+   - Operator visibility: `renew` is a first-class audit event — it appears in the portal activity
+     feed, the device timeline, and the "Renewed / last 7d" dashboard tile (portal ≥ v0.3.0).
 
 ### Two enrollment paths (see the slide docs)
 - **Path A — Token (per-device / classic):** operator reads the Device ID, mints a token bound to **branch + that exact device**, hands it over. Strongest binding; best for one remote/high-assurance device; bottleneck = a Device-ID round-trip per device.

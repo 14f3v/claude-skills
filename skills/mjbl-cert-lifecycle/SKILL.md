@@ -52,11 +52,18 @@ The whole point: marking the cert revoked in Vault does **not** make the gateway
 - Full detail + the signer audit-log smoking gun (`crl_status:403 / crl_published:false`) in `mjbl-mtls-revocation-postmortem.md`.
 
 ### B. Rotate the enroll-relay TLS cert (routine 90d or on key compromise)
-Executed 2026-06-05 (new serial `48:3e:8d:78…`). Full runbook: `mjbl-relay-cert-rotation-runbook.md`.
+Last executed **2026-08-06** (new serial `3d:47:c0:16…`, expires **2026-11-04**; old
+`48:3e:8d:78…` revoked). Full runbook: `mjbl-relay-cert-rotation-runbook.md`.
+
+> ⚠️ **This cert is now on the client-cert auto-renewal critical path.** Devices renew via
+> `POST https://enroll.vte.mjblao.local:8443/renew`, so if it lapses **every device renewal
+> fails at the handshake**. Rotate on time, and after rotating verify `/renew` — not just
+> `/enroll`. Keep **all three SANs**; the public `enroll.maruhanjapanbanklao.com` is
+> load-bearing for the planned SNI routing (k8s-config#121), not decorative.
 1. **Local ops host:** `openssl genpkey RSA:2048` + CSR with `subjectAltName=DNS:enroll.vte.mjblao.local,DNS:enroll.maruhanjapanbanklao.com,IP:10.88.101.143`. Key NEVER leaves the ops host.
 2. **Capture OLD serial** for the later revoke: `kubectl -n mjbl-enroll get secret enroll-relay-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -serial`.
 3. **Sign on CA host** (`! ssh ca`): `scp` the CSR up; `vault write pki/sign/mjbl-platform-role csr=@relay.csr common_name=enroll.vte.mjblao.local alt_names=... ip_sans=10.88.101.143 ttl=2160h`; append `ca_chain[]` to `tls.crt`; `scp` cert back; record NEW serial.
-4. **Re-create the Secret IMPERATIVELY** (the leak fix): `kubectl -n mjbl-enroll delete secret enroll-relay-tls` then `kubectl create secret generic … --from-file=tls.crt --from-file=tls.key --from-file=mjbl-root.crt`. NEVER `kubectl apply` a Secret manifest — it writes a `last-applied-configuration` annotation embedding `tls.key`. Verify no annotation: `kubectl -n mjbl-enroll get secret enroll-relay-tls -o jsonpath='{.metadata.annotations}'` prints empty.
+4. **Re-create the Secret IMPERATIVELY** (the leak fix): `kubectl -n mjbl-enroll delete secret enroll-relay-tls` then `kubectl create secret generic … --from-file=tls.crt --from-file=tls.key --from-file=mjbl-root.crt`. NEVER `kubectl apply` a Secret manifest — it writes a `last-applied-configuration` annotation embedding `tls.key`. **delete+create is also the ONLY way to REMOVE an annotation that already exists** — applying (even server-side) will not strip it. Verify with the **names-only** check below.
 5. **Roll the relay GitOps-clean:** bump `mjbl.internal/config-revision` in `deployments/mjbl-mtls-enrollment/production/deployment.fleet.yaml` → k8s-config PR → user merges → ArgoCD auto-syncs (~1 min, `maxUnavailable: 0`).
 6. **Verify:** `echo | openssl s_client -connect 10.88.101.143:8443 -servername enroll.vte.mjblao.local | openssl x509 -noout -serial -dates` → expect NEW serial.
 7. **Revoke OLD serial** (`! ssh ca`): `vault write pki/revoke serial_number=<OLD>` + `vault write pki/crl/rotate force=true`. CRL CronJob propagates ≤15 min.
@@ -64,7 +71,10 @@ Executed 2026-06-05 (new serial `48:3e:8d:78…`). Full runbook: `mjbl-relay-cer
 
 ### C. Rotate gateway/server cert, intermediate, or root CA
 Use `mjbl-CA-host-rotation-checklist.md` — follow OVERLAP→SWITCH→RETIRE (never retire-then-mint; a broken chain fails every mTLS handshake fleet-wide). Trust anchors (root, intermediate) propagate to every consumer BEFORE the leafs that chain to them.
-- **Server/gateway cert (§3, routine 90d):** `vault write pki/issue/mjbl-platform-role` → stage into `/etc/ssl/mjbl/` → per-cluster `bootstrap-secrets.sh` (re-renders `mjbl-tls-server` Secret + rollout) → verify handshake serves new serial → optionally `nuke.sh serial <old>` + `refresh-crl.sh`. NOTE: no cluster-side automation today — re-run bootstrap per cluster.
+- **Server/gateway cert (§3, routine 90d):** last rotated **2026-08-06** (serial `56:cb:c9:b0…`, expires **2026-11-04**; old `64:56:3f:54…` revoked as key-compromised). **Prefer `pki/sign` + a locally-generated key over `pki/issue`** — `pki/issue` makes Vault generate the private key and writes it onto the CA host. Then **delete+create** the `mjbl-tls-server` Secret (not `bootstrap-secrets.sh`, if an annotation must be removed) → `rollout restart` → verify the served serial **and run the canary selftest before revoking** → `vault write pki/revoke` + `pki/crl/rotate` + `refresh-crl.sh`.
+  - ⚠️ **`mjbl-CA-host-rotation-checklist.md` §3's example CN was WRONG** until 2026-08-06 (`agenttest.maruhanjapanbanklao.com`; production is `microloan.maruhanjapanbanklao.com`). **Always read the CN/SANs off the LIVE handshake** — never from a document. The gateway has **one** SAN and **no IP SAN**, unlike the relay.
+  - Role constraints: `mjbl-platform-role` = **RSA-2048**, `max_ttl` exactly **2160h**. Client certs use `mjbl-branch-client-role` = **EC P-256**, `clientAuth` only.
+  - NOTE: no cluster-side automation today — tracked as **k8s-config#119** (cert-manager + Vault issuer, `renewBefore: 720h`).
 - **Intermediate CA (§2, ~3–5 yr):** mint new int, Root signs (`pathlen:0`, 3650d), `vault write pki/intermediate/set-signed`, rebuild overlap bundle (root + BOTH intermediates), propagate to every cluster ConfigMap, reissue gateway cert + trigger client renewal, keep old-int CRL until last old leaf expires, then retire.
 - **Root CA (§1, ~10–20 yr, plan ≥2 yr early):** DISTRIBUTE new root FIRST (additive — every trust store trusts BOTH), then sign/cross-sign intermediate, switch issuance, verify, retire old root only after all consumers migrated.
 - **CRL (§5):** `refresh-crl.sh` regenerates root + intermediate CRLs (30-day validity, weekly refresh, `mjbl-crl-refresh` CronJob pulls). Alert on `kube_job_status_failed{job_name=~"mjbl-crl-refresh.*"}`.
@@ -75,10 +85,40 @@ Use `mjbl-CA-host-rotation-checklist.md` — follow OVERLAP→SWITCH→RETIRE (n
 - **nginx caches `ssl_crl` in memory until reload** and **TLS 1.3 verifies the client cert post-handshake** — a kept-alive connection is not re-checked mid-stream. A correct CRL only bites on the next handshake / after a gateway roll.
 - **`pki/crl/rotate` is a READ on the prod CA host** (the proven call is `vault read pki/crl/rotate`; `force=true` via write also works in the runbooks). In the internal-ca demo (Vault 2.0) the *write* returns 405 — don't confuse the two environments; swallow 405 only in demo scripts.
 - **NEVER `kubectl apply` a TLS Secret** — it embeds `tls.key` in the `last-applied-configuration` annotation (this is exactly how the relay key leaked into a transcript). Always re-create imperatively; verify no annotation. Never `kubectl get secret … -o yaml/json` (base64-dumps the key) and never `cat`/`echo` `tls.key`.
+- **🚨 NEVER print an annotation VALUE on a Secret — print annotation NAMES only.** The check this skill used to recommend, `-o jsonpath='{.metadata.annotations}'`, prints nothing when the annotation is ABSENT but dumps the whole value — i.e. **the base64 private key** — when it is PRESENT. That is the exact case the check exists to detect, so the documented check leaks the key it is looking for. **This bit for real on 2026-08-06** against `mjbl-tls-server`, forcing an unplanned gateway key rotation (k8s-config#115). Use:
+  ```bash
+  kubectl -n NS get secret S -o go-template='{{range $k,$v := .metadata.annotations}}{{$k}}{{"\n"}}{{end}}'
+  ```
+- **`create --dry-run=client -o yaml | kubectl apply -f -` IS an apply.** Rendering with `create` proves nothing; the **write verb** is what writes the annotation. `bootstrap-secrets.sh` did exactly this and silently embedded `service.key` on every run for two months, while a runbook asserted it "uses `create`, not `apply`". Fixed in k8s-config#114 (`apply --server-side` + a post-apply guard that fails if the annotation reappears). **Lesson: verify the claim, don't restate it.**
+- **A written-down audit that is never run is worth nothing.** The relay runbook's own follow-up said "audit the gateway server cert the same way" — it sat unactioned for two months and would have caught the above immediately.
+- **`/etc/ssl/mjbl/` on the OPS host (192.168.1.25) is STALE.** Its `root-ca.crt` / `intermediate-ca.crt` are *different certificates* with the *same subject names* (dated May 2026) from what Vault issues against today. Verifying a fresh cert against them fails with a misleading `error 20 unable to get local issuer certificate`. Use the **CA host's** copy or the chain Vault just returned, and compare by **SHA-256 fingerprint, not subject name**.
+- **Reproduce the wire chain length.** The gateway serves **2** certs (leaf+intermediate, no root); the relay serves **3**. `jq -r '.data.ca_chain[]'` yields 3 — trim for the gateway. Check the live handshake before installing.
 - **`!`-paste indents heredoc delimiters and breaks scripts.** Feed scripts to the CA host via `ssh ca 'sudo -n bash -s' < file` (or a quoted heredoc) rather than pasting.
 - **Operator kubeconfig discipline:** prod ops MUST `export KUBECONFIG=~/.kube/mjbl-prod.config`. A non-prod default context sent force-jobs to the wrong cluster during the post-mortem — a red herring that cost diagnosis time.
 - **Don't use the root token for routine cert ops** (steps sign/revoke pull `root_token` from `.vault-init.json`) — deferred hardening is a scoped issuance token.
 - **Durable fix for instant revocation is OCSP** (per-handshake, no roll-per-revoke, no propagation lag) — planned in `mjbl-gateway-ocsp-plan.md`, not yet shipped.
+- **Nothing tracks server-cert expiry — check it explicitly.** In Aug 2026 the gateway (T+26d), relay (T+28d) and revocation canary (T+32d) had ALL drifted under 35 days with nothing alerting, and were found only by manually inspecting a live handshake while investigating something unrelated. The client-cert auto-renewal work renews **device** certs only; **nothing renews these**. Treat **<30 days as act-now**:
+  ```bash
+  for t in "10.88.101.142:2399 microloan.maruhanjapanbanklao.com" \
+           "10.88.101.143:8443 enroll.vte.mjblao.local"; do set -- $t
+    echo -n "$2  "; echo | openssl s_client -connect $1 -servername $2 2>/dev/null | openssl x509 -noout -enddate; done
+  kubectl -n mjbl-mtls-gateway get secret revocation-canary -o jsonpath='{.data.valid\.crt}' \
+    | base64 -d | openssl x509 -noout -subject -enddate     # no provisioning script exists for this one
+  ```
+
+## Current expiry inventory (as of 2026-08-06)
+
+| Consumer | Serial | Expires |
+|---|---|---|
+| gateway `microloan.maruhanjapanbanklao.com` | `56:cb:c9:b0…` | **2026-11-04** |
+| relay `enroll.vte.mjblao.local` | `3d:47:c0:16…` | **2026-11-04** |
+| revocation canary (valid) | `36:e1:97:ae…` | **2026-11-04** |
+| MJBL Intermediate CA | — | 2036-05-31 |
+| MJBL Root CA | — | 2046-05-29 |
+
+⚠️ **All three leaf consumers expire the same day** — an artefact of rotating them together
+during the Aug 2026 incident. Either offset one deliberately at the next rotation, or land
+**k8s-config#119** first, which makes co-expiry irrelevant.
 
 ## Related skills
 - `internal-ca` — the 2-tier PKI bootstrap (Root + Intermediate + Vault PKI + OCSP/CRL servers + `nuke.sh`) this lifecycle operates on.
