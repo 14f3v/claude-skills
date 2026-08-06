@@ -26,7 +26,7 @@ version: 0.1.0
 
 **Vault PKI**
 - Issuing role for server/relay certs: `pki/sign/mjbl-platform-role` (CSR-signing) / `pki/issue/mjbl-platform-role` (issue w/ key). Client role: `mjbl-branch-client-role`.
-- Revoke: `vault write pki/revoke serial_number=<serial>`. Publish: `vault write pki/crl/rotate force=true` (or `vault read pki/crl/rotate`). `auto_rebuild` DEFERS CRL regen, so the explicit rotate is mandatory after a revoke. **NOTE:** Vault 2.0 dropped `pki/crl/rotate` as a *write* in the internal-ca demo (405) — but the PROD CA host honors it (`vault read pki/crl/rotate` is the proven call; helper scripts use it).
+- Revoke: `vault write pki/revoke serial_number=<serial>`. Publish: **`vault read pki/crl/rotate`** — the write form returns **405 unsupported operation** on this build (verified 2026-08-06 with BOTH the root and cert-ops tokens, so it is an endpoint limit, not a permission issue). `auto_rebuild` DEFERS CRL regen, so the explicit rotate is mandatory after a revoke. The signer and the helper scripts already use the read form; only the human-facing docs ever claimed otherwise.
 - Root token at `/home/mjbl/.vault-init.json` (`jq -r .root_token`). Hardening TODO: scope to a non-root issuance token.
 - Signer AppRole policy `mjbl-enroll` (repo `signer/mjbl-enroll.policy.hcl`) MUST grant `path "pki/crl/rotate" { capabilities = ["read"] }` — the missing grant was the post-mortem root cause.
 
@@ -44,7 +44,7 @@ version: 0.1.0
 
 ### A. Revoke a device — the 3-HOP enforcement chain (vault revoke alone is NOT enough)
 The whole point: marking the cert revoked in Vault does **not** make the gateway refuse it. All three hops must complete and a NEW handshake must occur.
-1. **Hop 1 — Vault** (`! ssh ca`): `vault write pki/revoke serial_number=<serial>` then `vault write pki/crl/rotate force=true` (rebuilds Vault's CRL — `auto_rebuild` would otherwise defer it).
+1. **Hop 1 — Vault** (`! ssh ca`): `vault write pki/revoke serial_number=<serial>` then **`vault read pki/crl/rotate`** (rebuilds Vault's CRL — `auto_rebuild` would otherwise defer it).
 2. **Hop 2 — CA host publish:** run `/opt/mjbl-demo/scripts/refresh-crl.sh` on the CA host (rebuilds root CRL via openssl, pulls intermediate CRL from Vault, writes the `:8888` docroot + `/etc/ssl/mjbl/crl-bundle.pem`). The systemd timer does this automatically; run it by hand to not wait.
 3. **Hop 3 — Cluster:** CronJob `mjbl-crl-refresh` (ns `mjbl-mtls-gateway`) fetches `:8888`, patches the `mjbl-tls-trust` ConfigMap, rolls nginx (≤15 min on the slow path, ~2–3 min on the tuned `*/2` schedule). Force: `kubectl create job --from=cronjob/mjbl-crl-refresh enforce-now -n mjbl-mtls-gateway` or `enforce-crl-now.sh`.
 - `/tmp/mjbl_revoke_device.sh <serial>` does hops 1+2 for you; still confirm hop-3 propagated.
@@ -66,7 +66,7 @@ Last executed **2026-08-06** (new serial `3d:47:c0:16…`, expires **2026-11-04*
 4. **Re-create the Secret IMPERATIVELY** (the leak fix): `kubectl -n mjbl-enroll delete secret enroll-relay-tls` then `kubectl create secret generic … --from-file=tls.crt --from-file=tls.key --from-file=mjbl-root.crt`. NEVER `kubectl apply` a Secret manifest — it writes a `last-applied-configuration` annotation embedding `tls.key`. **delete+create is also the ONLY way to REMOVE an annotation that already exists** — applying (even server-side) will not strip it. Verify with the **names-only** check below.
 5. **Roll the relay GitOps-clean:** bump `mjbl.internal/config-revision` in `deployments/mjbl-mtls-enrollment/production/deployment.fleet.yaml` → k8s-config PR → user merges → ArgoCD auto-syncs (~1 min, `maxUnavailable: 0`).
 6. **Verify:** `echo | openssl s_client -connect 10.88.101.143:8443 -servername enroll.vte.mjblao.local | openssl x509 -noout -serial -dates` → expect NEW serial.
-7. **Revoke OLD serial** (`! ssh ca`): `vault write pki/revoke serial_number=<OLD>` + `vault write pki/crl/rotate force=true`. CRL CronJob propagates ≤15 min.
+7. **Revoke OLD serial** (`! ssh ca`): `vault write pki/revoke serial_number=<OLD>` + **`vault read pki/crl/rotate`**. CRL CronJob propagates ≤15 min.
 8. **Shred local key:** `shred -u tls.key relay.csr`.
 
 ### C. Rotate gateway/server cert, intermediate, or root CA
@@ -83,7 +83,7 @@ Use `mjbl-CA-host-rotation-checklist.md` — follow OVERLAP→SWITCH→RETIRE (n
 - **`vault revoke` ≠ enforced.** The post-mortem's whole lesson: revocation is a multi-hop, pull-based, eventually-consistent chain. Any hop can fail silently. Always complete all 3 hops AND verify a revoked cert is actually refused on a fresh handshake.
 - **IaC drift broke the security control.** The `pki/crl/rotate` grant was committed in `signer/mjbl-enroll.policy.hcl` but never `vault policy write`'d to live Vault → every revoke logged `crl_status:403 / crl_published:false` and the CRL never updated. A grant in git is NOT a grant in Vault. Reconcile repo ↔ live.
 - **nginx caches `ssl_crl` in memory until reload** and **TLS 1.3 verifies the client cert post-handshake** — a kept-alive connection is not re-checked mid-stream. A correct CRL only bites on the next handshake / after a gateway roll.
-- **`pki/crl/rotate` is a READ on the prod CA host** (the proven call is `vault read pki/crl/rotate`; `force=true` via write also works in the runbooks). In the internal-ca demo (Vault 2.0) the *write* returns 405 — don't confuse the two environments; swallow 405 only in demo scripts.
+- **🚨 `pki/crl/rotate` is a READ — the write does NOT work, anywhere.** `vault read pki/crl/rotate` → 200 `{"success":true}`. `vault write pki/crl/rotate force=true` → **405 unsupported operation**, measured 2026-08-06 on the PROD CA host with the root token *and* the cert-ops token, so it is an endpoint limitation, not a policy denial. Earlier docs (this skill included) claimed the write "also works in the runbooks" — **it never did**; it fails silently, and any script without a `|| vault read` fallback leaves the CRL un-rebuilt while the revoke appears to succeed. That is precisely the 2026-06 incident signature (`crl_status:403 / crl_published:false`). The signer already does it correctly (`GET pki/crl/rotate`); only the human-facing docs were wrong.
 - **NEVER `kubectl apply` a TLS Secret** — it embeds `tls.key` in the `last-applied-configuration` annotation (this is exactly how the relay key leaked into a transcript). Always re-create imperatively; verify no annotation. Never `kubectl get secret … -o yaml/json` (base64-dumps the key) and never `cat`/`echo` `tls.key`.
 - **🚨 NEVER print an annotation VALUE on a Secret — print annotation NAMES only.** The check this skill used to recommend, `-o jsonpath='{.metadata.annotations}'`, prints nothing when the annotation is ABSENT but dumps the whole value — i.e. **the base64 private key** — when it is PRESENT. That is the exact case the check exists to detect, so the documented check leaks the key it is looking for. **This bit for real on 2026-08-06** against `mjbl-tls-server`, forcing an unplanned gateway key rotation (k8s-config#115). Use:
   ```bash
