@@ -49,7 +49,7 @@ Assigned IPs (check `kubectl get svc -A | grep LoadBalancer` for the current tru
 |---|---|
 | `10.88.101.140` | `ingress-nginx-controller` (the cluster ingress) |
 | `10.88.101.141` | `microloan-app` |
-| `10.88.101.142` | `mjbl-mtls-gateway` (`:2399`) |
+| `10.88.101.142` | `mjbl-mtls-gateway` — `:2399` app mTLS + **`:2401` renewal passthrough** (non-decrypting `stream{}` → relay `10.88.101.143:8445`; publicly NAT'd as `microloan.maruhanjapanbanklao.com:2401`) |
 | `10.88.101.143` | `mjbl-enroll-relay` (`:8443`) |
 | `10.88.101.144` | `mjbl-api-gateway` — LapNet domestic-payment L4 (`:8096`) |
 
