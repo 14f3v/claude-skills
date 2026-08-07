@@ -56,16 +56,28 @@ Last executed **2026-08-06** (new serial `3d:47:c0:16…`, expires **2026-11-04*
 `48:3e:8d:78…` revoked). Full runbook: `mjbl-relay-cert-rotation-runbook.md`.
 
 > ⚠️ **This cert is now on the client-cert auto-renewal critical path.** Devices renew via
-> `POST https://enroll.vte.mjblao.local:8443/renew`, so if it lapses **every device renewal
-> fails at the handshake**. Rotate on time, and after rotating verify `/renew` — not just
-> `/enroll`. Keep **all three SANs**; the public `enroll.maruhanjapanbanklao.com` is
-> load-bearing for the planned SNI routing (k8s-config#121), not decorative.
-1. **Local ops host:** `openssl genpkey RSA:2048` + CSR with `subjectAltName=DNS:enroll.vte.mjblao.local,DNS:enroll.maruhanjapanbanklao.com,IP:10.88.101.143`. Key NEVER leaves the ops host.
+> `POST /renew`, so if it lapses **every device renewal fails at the handshake**. Rotate on
+> time, and after rotating verify `/renew` — not just `/enroll`.
+>
+> **Keep ALL FOUR SANs.** Since 2026-08-07 renewal is public: the device connects to
+> `https://microloan.maruhanjapanbanklao.com:2401`, the gateway passes the bytes through
+> **without decrypting**, and **TLS terminates at the RELAY** — so the device validates the
+> `microloan` name against *this* cert, not the gateway's. Drop that SAN and every public
+> renewal fails `no alternative certificate subject name matches` while `/enroll` still looks
+> perfectly healthy. Current cert expires **2026-11-05**.
+1. **Local ops host:** `openssl genpkey RSA:2048` + CSR with `subjectAltName=DNS:enroll.vte.mjblao.local,DNS:enroll.maruhanjapanbanklao.com,DNS:microloan.maruhanjapanbanklao.com,IP:10.88.101.143`. Key NEVER leaves the ops host.
 2. **Capture OLD serial** for the later revoke: `kubectl -n mjbl-enroll get secret enroll-relay-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -serial`.
 3. **Sign on CA host** (`! ssh ca`): `scp` the CSR up; `vault write pki/sign/mjbl-platform-role csr=@relay.csr common_name=enroll.vte.mjblao.local alt_names=... ip_sans=10.88.101.143 ttl=2160h`; append `ca_chain[]` to `tls.crt`; `scp` cert back; record NEW serial.
 4. **Re-create the Secret IMPERATIVELY** (the leak fix): `kubectl -n mjbl-enroll delete secret enroll-relay-tls` then `kubectl create secret generic … --from-file=tls.crt --from-file=tls.key --from-file=mjbl-root.crt`. NEVER `kubectl apply` a Secret manifest — it writes a `last-applied-configuration` annotation embedding `tls.key`. **delete+create is also the ONLY way to REMOVE an annotation that already exists** — applying (even server-side) will not strip it. Verify with the **names-only** check below.
 5. **Roll the relay GitOps-clean:** bump `mjbl.internal/config-revision` in `deployments/mjbl-mtls-enrollment/production/deployment.fleet.yaml` → k8s-config PR → user merges → ArgoCD auto-syncs (~1 min, `maxUnavailable: 0`).
-6. **Verify:** `echo | openssl s_client -connect 10.88.101.143:8443 -servername enroll.vte.mjblao.local | openssl x509 -noout -serial -dates` → expect NEW serial.
+6. **Verify BOTH paths** — internal serial *and* the public renewal edge, because they exercise different SANs and different sockets:
+   ```bash
+   echo | openssl s_client -connect 10.88.101.143:8443 -servername enroll.vte.mjblao.local \
+     | openssl x509 -noout -serial -dates                       # NEW serial
+   curl -sS -o /dev/null -w '%{http_code}\n' https://microloan.maruhanjapanbanklao.com:2401/renew
+   # expect 401 (client_cert_required) — proves the public listener + SAN + NAT all still work.
+   # /enroll on :2401 must return 404, NOT 401: renew-only gating is intact.
+   ```
 7. **Revoke OLD serial** (`! ssh ca`): `vault write pki/revoke serial_number=<OLD>` + **`vault read pki/crl/rotate`**. CRL CronJob propagates ≤15 min.
 8. **Shred local key:** `shred -u tls.key relay.csr`.
 
@@ -78,6 +90,21 @@ Use `mjbl-CA-host-rotation-checklist.md` — follow OVERLAP→SWITCH→RETIRE (n
 - **Intermediate CA (§2, ~3–5 yr):** mint new int, Root signs (`pathlen:0`, 3650d), `vault write pki/intermediate/set-signed`, rebuild overlap bundle (root + BOTH intermediates), propagate to every cluster ConfigMap, reissue gateway cert + trigger client renewal, keep old-int CRL until last old leaf expires, then retire.
 - **Root CA (§1, ~10–20 yr, plan ≥2 yr early):** DISTRIBUTE new root FIRST (additive — every trust store trusts BOTH), then sign/cross-sign intermediate, switch issuance, verify, retire old root only after all consumers migrated.
 - **CRL (§5):** `refresh-crl.sh` regenerates root + intermediate CRLs (30-day validity, weekly refresh, `mjbl-crl-refresh` CronJob pulls). Alert on `kube_job_status_failed{job_name=~"mjbl-crl-refresh.*"}`.
+
+### D. Server-cert expiry monitoring + the scoped `cert-ops` token (Aug 2026)
+Both production server certs were found **26 and 28 days from expiry, unwatched**, in the middle of
+the renewal rollout — and the relay cert sits on the renewal critical path, so it expiring would
+have taken out the very mechanism meant to keep the fleet alive. Both were rotated
+(gateway → **2026-11-04**, relay → **2026-11-05**). Two controls came out of it:
+- **`k8s-config/tools/cert-ops/mjbl-server-cert-renew.sh`** — `--check` (default) / `--renew`,
+  installed as **`mjbl-server-cert-check.timer`** (daily `--check`). "Comfortable headroom" was the
+  vague check that let three certs drift; a timer with a number is the fix.
+- **`k8s-config/vault/cert-ops.policy.hcl`** — a scoped policy replacing the root token for routine
+  cert ops. Grants `pki/sign/mjbl-platform-role`, `pki/sign/mjbl-branch-client-role`, `pki/revoke`,
+  `pki/crl/rotate` (read+update), read-only `pki/cert/*`, `pki/certs`, `pki/roles/*`.
+  **DENIES** `pki/issue/*`, `pki/root/*`, `pki/config/*`, `pki/intermediate/*`, `pki/tidy*`,
+  `sys/*`, `enroll/*` — so a leaked cert-ops token cannot mint a key it holds, re-sign the
+  intermediate, or reach the enrollment token store.
 
 ## Gotchas & hard-won lessons
 - **`vault revoke` ≠ enforced.** The post-mortem's whole lesson: revocation is a multi-hop, pull-based, eventually-consistent chain. Any hop can fail silently. Always complete all 3 hops AND verify a revoked cert is actually refused on a fresh handshake.

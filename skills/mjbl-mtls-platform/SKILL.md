@@ -39,8 +39,8 @@ For *doing* work in one plane, this skill routes you — then use the focused si
 | **Trust/PKI** | Vault PKI (Root + Intermediate, KV-v2 `enroll/`) | CA host `mjbl-ca-crl` (internal zone, airgapped) | `10.88.1.116` | Vault 2.0.1, Raft. Issuing role `pki/sign/mjbl-branch-client-role` (EC P-256, `clientAuth`, CN `<branch>.<uuid>.mjbl.internal`). AppRole `mjbl-enroll`. |
 | **Trust/PKI** | Signer | CA host | `:8444` (admin-Bearer + IP-allowlist) | `/opt/mjbl-enroll/mjbl_enroll_signer.py`, systemd `mjbl-enroll-signer`, user `mjbl-enroll`. Endpoints: `/mint /sign /renew /revoke /devices /activity /allowlist /claim-status /healthz`. **`/renew` (2026-08-06)** is token-free: the device's CURRENT valid cert IS the credential, forwarded by the relay as base64 DER in `X-Client-Cert-DER` and **re-validated independently** by the signer (8-stage fail-closed, incl. a live Vault revocation gate). Audit `/var/log/mjbl-enrollment.log`. Auths to Vault via AppRole `mjbl-enroll` (`/opt/mjbl-enroll/approle/{role_id,secret_id}`); secret_id recovery = `mjbl-enroll-signer-vault-recover.sh` + monthly `mjbl-enroll-signer-vault-recover.timer`. |
 | **Trust/PKI** | CRL HTTP server + OCSP responder | CA host | CRL `:8888` (docroot `/opt/mjbl-demo/crl-serve`), OCSP `:2560` | Hop-2 publish timer `mjbl-crl-publish.timer` (**1 min**, intermediate-only, churn-free); `mjbl-crl-root-refresh.timer` (daily). `refresh-crl.sh` / `publish-intermediate-crl.sh`. |
-| **Access** | mTLS gateway (nginx) | cluster ns `mjbl-mtls-gateway` (rkek8s) | LB `10.88.101.142:2399` | `ssl_verify_client on`, `ssl_verify_depth 2`, `ssl_crl /etc/ssl/mjbl/crl-bundle.pem`. Injects `X-Client-CN/Serial/Verify`. CronJob `mjbl-crl-refresh` (`*/2`, sha256 change-detect → rollout). Guardrail CronJob `mjbl-revocation-selftest` (`*/5`, valid+revoked canary). |
-| **Enrollment** | Relay (LB → signer `/sign`, `/renew`) | cluster ns `mjbl-enroll` (rkek8s) | LB `10.88.101.143:8443`, `enroll.vte.mjblao.local` | Device→CA path; keeps the CA airgapped from the device network. **One listener, `verify_mode=CERT_OPTIONAL`**: `/enroll` presents NO client cert (token-authenticated), `/renew` REQUIRES one and enforces its presence **in application code**, because Python `ssl` applies `verify_mode` per socket, not per path. |
+| **Access** | mTLS gateway (nginx) | cluster ns `mjbl-mtls-gateway` (rkek8s) | LB `10.88.101.142` — **`:2399` app** + **`:2401` renew** | `:2399` = the app gateway: `ssl_verify_client on`, `ssl_verify_depth 2`, `ssl_crl /etc/ssl/mjbl/crl-bundle.pem`, injects `X-Client-CN/Serial/Verify`. `:2401` = a **dedicated `stream{}` passthrough** that does NOT decrypt — unconditional `proxy_pass 10.88.101.143:8445` (`nginx-renew-conf.fleet.yaml`). CronJob `mjbl-crl-refresh` (`*/2`, sha256 change-detect → rollout). Guardrail CronJob `mjbl-revocation-selftest` (`*/5`, valid+revoked canary). |
+| **Enrollment** | Relay (LB → signer `/sign`, `/renew`) | cluster ns `mjbl-enroll` (rkek8s) | LB `10.88.101.143` — **`:8443` full** + **`:8445` renew-only** | Device→CA path; keeps the CA airgapped from the device network. **`verify_mode=CERT_OPTIONAL` on both sockets**: `/enroll` presents NO client cert (token-authenticated), `/renew` REQUIRES one and enforces its presence **in application code**, because Python `ssl` applies `verify_mode` per socket, not per path. `:8445` (`PUBLIC_RENEW_PORT`) additionally serves **only `/renew`** — see the public-exposure note below. Image `enroll-relay:0.4.1`. |
 | **Operations** | Operator portal — BFF (Bun + Hono) | cluster ns `mjbl-mtls-operator-portal` | `:8787` | **Only** component that talks the signer admin API (admin token server-side, pins root CA). `AUTH_MODE=bootstrap`\|`ldap`. RBAC + branch-scope, CSRF, `__Host-` session. |
 | **Operations** | Operator portal — Web (Vite/React + nginx) | same ns | Ingress `mtls-portal.vte.mjblao.local` | Same-origin nginx reverse-proxies `/api` → BFF. Dashboard / Devices / Enroll / Enroll-by-QR / Allowlist / Activity. `VITE_USE_MOCK=false` in prod image. |
 | **Device** | agency_v2 (Flutter/Android) | pilot tablets | — | Self-generates stable UUID, builds CSR, enrolls (token or QR), stores cert in secure storage, presents on every mTLS call; routes revoked/expired back to re-enroll. |
@@ -76,6 +76,39 @@ For *doing* work in one plane, this skill routes you — then use the focused si
      7-day cliff, one-deep identity backup so a partial write cannot brick the device.
    - Operator visibility: `renew` is a first-class audit event — it appears in the portal activity
      feed, the device timeline, and the "Renewed / last 7d" dashboard tile (portal ≥ v0.3.0).
+   - **Expiry is NOT recoverable.** The cert IS the credential, so an expired one is refused three
+     times over: the relay handshake (`CERT_OPTIONAL` + `load_verify_locations` → OpenSSL aborts
+     before application code), the signer's stage-2 `remaining <= 0` → `401 cert_expired`, and the
+     gateway's path validation. A grace period would mean accepting an expired credential as proof
+     of identity, i.e. no expiry at all — the "other credential" fallback IS the operator
+     enrollment token. Miss the window → full operator re-enrollment. See `mjbl-client-provisioning`.
+
+#### The PUBLIC renewal endpoint (live 2026-08-07) — why a second port, not a path
+Renewal originally only worked on the internal network, which is useless for a tablet that is
+off-site when its window opens. It is now reachable from anywhere:
+
+```
+device → microloan.maruhanjapanbanklao.com:2401   public DNS → NAT 202.136.241.166
+       → gateway 10.88.101.142:2401               stream{} passthrough, NO decryption
+       → relay  10.88.101.143:8445                renew-only listener
+       → TLS terminates AT THE RELAY              mTLS stays end-to-end, device→relay
+```
+
+- **The path lives INSIDE TLS**, so nothing in front of the relay — NAT, LB, SNI router — can
+  publish `/renew` without also publishing `/enroll`, an endpoint that mints certs for a token.
+  So the relay gates on **which local socket the connection landed on** (`getsockname()[1]`):
+  server-side and unspoofable, unlike `Host` or any `X-Forwarded-*` claim. **The port IS the
+  routing decision**, which is why the gateway's `proxy_pass` is unconditional.
+- **Allowlist, not denylist** (`PUBLIC_ALLOWED_PATHS = {"/renew"}`) — a denylist leaks every path
+  added later. Off-list → **404**, not 403: a 403 confirms the endpoint exists.
+- `getsockname()` failure **fails closed** (treated as public); `validate_listener_ports()` refuses
+  to start if the public port equals the internal one, which would apply renew-only policy to
+  `/enroll` fleet-wide.
+- **Path-routing through the existing `:2400` mTLS gateway was rejected** — it would have moved
+  cost out of infra and into the *trust model*: header-forwarded identity instead of a real peer
+  cert, a new gateway→relay mTLS hop, a rate limiter collapsing to one fleet-wide bucket, and
+  dual-path auth during migration. Passthrough keeps the relay the only thing that validates a
+  device cert. (`k8s-config#128` closed in favour of `#129`.)
 
 ### Two enrollment paths (see the slide docs)
 - **Path A — Token (per-device / classic):** operator reads the Device ID, mints a token bound to **branch + that exact device**, hands it over. Strongest binding; best for one remote/high-assurance device; bottleneck = a Device-ID round-trip per device.
@@ -105,6 +138,19 @@ Each routes to the runbook that owns the detail — read it before prod-touching
 - **CA-host script heredoc gotcha:** feed scripts via `ssh ca 'sudo -n bash -s' < file` (interactive `!`-paste indents heredoc delimiters and breaks). `pki/crl/rotate` is a **read**, not a write (`write` → 405).
 - **The signer's AppRole `secret_id` expires (default `secret_id_ttl=720h` ≈ 30 days) → Vault user-lockout → signer runs `degraded`/`audit-only`; new enroll + revoke fail, existing devices unaffected.** Confirmed incident 2026-07-06 (secret_id issued 06-04, expired 07-04). Now mitigated: `secret_id_ttl=0` (non-expiring) + monthly `mjbl-enroll-signer-vault-recover.timer`. One-shot fix / rotation: `mjbl-enroll-signer-vault-recover.sh`. Unlock path is `sys/locked-users/<approle-mount-accessor>/unlock/<role_id>`.
 - **Break-glass Vault token:** the root token + unseal keys sit in **plaintext at `/root/vault-init.json`** on the CA host — `export VAULT_TOKEN=$(sudo jq -r .root_token /root/vault-init.json)` gets you an authenticated root session (this build even requires a token for `generate-root`, so there's no token-less recovery path). It works, but it's a hardening gap: move it off-host and give the recovery script a **scoped token** (just `auth/approle/role/mjbl-enroll/secret-id` + the unlock path) instead of root. See `mjbl-prod-hardening-checklist.md`.
+- **Read the ACTUAL public response after exposing anything.** The relay had been leaking
+  `Server: mjbl-enroll-relay/0.1.0 Python/3.12.13` — harmless while internal, but on a published
+  endpoint it hands over the exact codebase to go read and a runtime version to match CVEs
+  against, for zero operational benefit (nothing legitimate parses it). It was **invisible from
+  inside the cluster** and only appeared in a real external `curl -i`. Fixed in `0.4.1` by
+  overriding `version_string()` to return `""`. Verify exposure from off-network, not from a pod.
+- **A `v*` tag on `mjbl-mtls-enrollment` auto-deploys to production** — the relay-image job builds,
+  pushes, and bumps the `k8s-config` image tag, and ArgoCD rolls it. Tagging is a prod write.
+- **`v*` tag builds carry NO `workflow_dispatch` inputs** — every `github.event.inputs.*` is empty,
+  so the `|| 'default'` fallback IS the shipped contract. This nearly shipped APK `1.1.43 (55)`
+  with `MTLS_RENEW_BASE` empty, which (higher versionCode) would have superseded the good build
+  and silently reverted the pilot fleet to internal-only renewal. Flip the workflow **default**
+  before tagging; never rely on dispatch inputs for a tag release.
 - **Prod gates:** CA-host changes go via `! ssh ca`; `k8s-config` merges are user-gated (agent self-merge denied → user merges → triggers the ArgoCD roll); ArgoCD prod writes / force-sync are user-gated/denied to the agent (reads OK).
 
 ## KB index — every `/home/mjbl/mjbl-*.md` runbook by topic
