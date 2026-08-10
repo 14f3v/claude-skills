@@ -1,0 +1,8 @@
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "__PROJECT_NAME__-db",
+			"database_id": "<DB_ID>",
+			"migrations_dir": "./migrations"
+		}
+	]
