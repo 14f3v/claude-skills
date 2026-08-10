@@ -1,0 +1,6 @@
+	"r2_buckets": [
+		{
+			"binding": "BUCKET",
+			"bucket_name": "__PROJECT_NAME__-bucket"
+		}
+	]

@@ -1,0 +1,5 @@
+# Local secrets for `wrangler dev`. Copy this file to `.dev.vars` (gitignored)
+# and fill in real values. `wrangler dev` loads `.dev.vars` automatically.
+#
+# Example:
+# MY_SECRET="local-value"

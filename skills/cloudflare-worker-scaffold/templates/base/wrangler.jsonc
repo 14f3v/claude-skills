@@ -1,0 +1,13 @@
+{
+	// Keep this marker line intact: the scaffolder replaces it with the selected
+	// binding blocks (hyperdrive / d1_databases / kv_namespaces / r2_buckets).
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "__PROJECT_NAME__",
+	"main": "src/index.ts",
+	"compatibility_date": "__COMPAT_DATE__",
+	"compatibility_flags": ["nodejs_compat"],
+	"observability": {
+		"enabled": true
+	}
+	/* @scaffold:bindings */
+}
