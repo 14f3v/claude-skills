@@ -41,7 +41,7 @@ For *doing* work in one plane, this skill routes you — then use the focused si
 | **Trust/PKI** | CRL HTTP server + OCSP responder | CA host | CRL `:8888` (docroot `/opt/mjbl-demo/crl-serve`), OCSP `:2560` | Hop-2 publish timer `mjbl-crl-publish.timer` (**1 min**, intermediate-only, churn-free); `mjbl-crl-root-refresh.timer` (daily). `refresh-crl.sh` / `publish-intermediate-crl.sh`. |
 | **Access** | mTLS gateway (nginx) | cluster ns `mjbl-mtls-gateway` (rkek8s) | LB `10.88.101.142` — **`:2399` app** + **`:2401` renew** | `:2399` = the app gateway: `ssl_verify_client on`, `ssl_verify_depth 2`, `ssl_crl /etc/ssl/mjbl/crl-bundle.pem`, injects `X-Client-CN/Serial/Verify`. `:2401` = a **dedicated `stream{}` passthrough** that does NOT decrypt — unconditional `proxy_pass 10.88.101.143:8445` (`nginx-renew-conf.fleet.yaml`). CronJob `mjbl-crl-refresh` (`*/2`, sha256 change-detect → rollout). Guardrail CronJob `mjbl-revocation-selftest` (`*/5`, valid+revoked canary). |
 | **Enrollment** | Relay (LB → signer `/sign`, `/renew`) | cluster ns `mjbl-enroll` (rkek8s) | LB `10.88.101.143` — **`:8443` full** + **`:8445` renew-only** | Device→CA path; keeps the CA airgapped from the device network. **`verify_mode=CERT_OPTIONAL` on both sockets**: `/enroll` presents NO client cert (token-authenticated), `/renew` REQUIRES one and enforces its presence **in application code**, because Python `ssl` applies `verify_mode` per socket, not per path. `:8445` (`PUBLIC_RENEW_PORT`) additionally serves **only `/renew`** — see the public-exposure note below. Image `enroll-relay:0.4.1`. |
-| **Operations** | Operator portal — BFF (Bun + Hono) | cluster ns `mjbl-mtls-operator-portal` | `:8787` | **Only** component that talks the signer admin API (admin token server-side, pins root CA). `AUTH_MODE=bootstrap`\|`ldap`. RBAC + branch-scope, CSRF, `__Host-` session. |
+| **Operations** | Operator portal — BFF (Bun + Hono) | cluster ns `mjbl-mtls-operator-portal` | `:8787` | **Only** component that talks the signer admin API (admin token server-side, pins root CA). `AUTH_MODE=bootstrap`\|`ldap` — AD **authenticates**, the portal **authorizes** via a DB-backed permission catalog (branch-scoped), CSRF, `__Host-` session. Own Postgres StatefulSet holds RBAC + sessions + device labels. Image `v0.4.0`. |
 | **Operations** | Operator portal — Web (Vite/React + nginx) | same ns | Ingress `mtls-portal.vte.mjblao.local` | Same-origin nginx reverse-proxies `/api` → BFF. Dashboard / Devices / Enroll / Enroll-by-QR / Allowlist / Activity. `VITE_USE_MOCK=false` in prod image. |
 | **Device** | agency_v2 (Flutter/Android) | pilot tablets | — | Self-generates stable UUID, builds CSR, enrolls (token or QR), stores cert in secure storage, presents on every mTLS call; routes revoked/expired back to re-enroll. |
 | **Ops runner** | THIS host | `root-ca` `192.168.1.25` `/home/mjbl` | — | The remote runner: has `ssh ca` to the CA host and the prod kubeconfig. Not in the trust boundary. |
@@ -51,7 +51,7 @@ For *doing* work in one plane, this skill routes you — then use the focused si
 - **facility** — hosts the ArgoCD control plane (`argocd.vte.mjblao.local`).
 - **`192.168.1.65`** — UAT / the default `kubectl` context.
 
-### The four end-to-end flows
+### The five end-to-end flows
 1. **Enroll:** operator → Portal "Enroll" / "Enroll by QR" → BFF → signer `/mint` (admin) → one-time token → device (token or scans claim-QR) → relay → signer `/sign` (token + CSR) → device cert.
 2. **Access (every request):** device → mutual TLS to gateway (presents cert) → nginx verifies chain + CRL → backend, with `X-Client-CN/Serial/Verify` injected.
 3. **Revoke (the pull chain that must stay healthy):** Portal Revoke → BFF → signer `/revoke` → Vault `pki/revoke` + `pki/crl/rotate` → CA-host hop-2 timer publishes `:8888` (≤1 min) → cluster CRL CronJob fetches + rolls gateway (≤2 min) → revoked cert refused on next handshake. Self-tested every 5 min.
@@ -82,6 +82,15 @@ For *doing* work in one plane, this skill routes you — then use the focused si
      gateway's path validation. A grace period would mean accepting an expired credential as proof
      of identity, i.e. no expiry at all — the "other credential" fallback IS the operator
      enrollment token. Miss the window → full operator re-enrollment. See `mjbl-client-provisioning`.
+5. **Edit device details (portal-only, live 2026-08-10 — v0.4.0):** operator holding the branch-scoped
+   **`device:edit`** permission → Devices drawer → Edit → `POST /devices/label` → `portal.device_labels`.
+   **This never touches the signer, Vault, or the certificate.** The signer *cannot* do it: its
+   inventory is replayed from an append-only audit log, so `metadata` is write-once at `/mint` (and
+   `/renew` deliberately inherits it, so a wrong alias would otherwise propagate forever). The portal
+   row is keyed **`(branch, device_id)`** — not serial, which rotates on renewal — and is merged per
+   key over `/devices`, so an un-edited field keeps its mint value and clearing all fields restores it.
+   An alias is an *operational label*, not a cryptographic fact: the signer stays authoritative for
+   certificates, the portal for human-facing labels. See `mjbl-operator-portal`.
 
 #### The PUBLIC renewal endpoint (live 2026-08-07) — why a second port, not a path
 Renewal originally only worked on the internal network, which is useless for a tablet that is
