@@ -10,10 +10,23 @@ version: 0.1.1
 
 ## Access
 ```bash
-export KUBECONFIG=~/.kube/mjbl-prod.config      # this is rkek8s, NOT the default ctx
+export KUBECONFIG=~/.kube/mjbl-prod.config      # rkek8s — but see the warning below
 kubectl get nodes -o wide
 ```
-- The **default** `kubectl` context (`kubernetes-admin@kubernetes`) is **UAT**, not prod — a very common mix-up. If a prod resource shows `NotFound`, you're almost certainly on the UAT context. Always set `KUBECONFIG=~/.kube/mjbl-prod.config` for prod.
+- ⚠️ **CORRECTED 2026-08-31 — the bare `kubectl` default context is now PRODUCTION, not UAT.**
+  Measured: `~/.kube/config` → context `kubernetes-admin@kubernetes` → cluster `kubernetes` →
+  `server: https://rkek8s.vte.mjblao.local:6443`. A bare `kubectl get nodes` returns
+  `mjbl-k8s-n01..n04` (`10.88.101.32`, `10.88.1.27`, `10.88.101.31`, `10.88.1.26`) — that is rkek8s.
+  UAT now lives in its own file: `KUBECONFIG=~/.kube/mjbl-uat.config` (→ `https://192.168.1.65:6443`,
+  apiserver cert SAN `mjbl-graphql-api`).
+  **This inverts the old warning.** An unqualified `kubectl delete`, typed in the belief that bare
+  `kubectl` is UAT, now lands on the live banking cluster.
+- **The context NAME cannot tell you which cluster you are on.** Both were registered from stock
+  kubeadm kubeconfigs, so both are literally named `kubernetes-admin@kubernetes`. Check the server URL,
+  never the context name:
+  ```bash
+  kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'; echo
+  ```
 - **Network segmentation:** prod (`10.88.x`) is **not routable from the office/UAT LAN** (`192.168.1.25` → "No route to host"). To test a prod IP/port from a real prod vantage point, jump:
   ```bash
   ssh khemphet-mac            # Mac jump host
