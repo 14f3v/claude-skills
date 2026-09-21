@@ -1,7 +1,7 @@
 ---
 name: mjbl-k8s-facility
-description: This skill should be used when the user asks to operate the MJBL FACILITY cluster or ArgoCD — "where does ArgoCD run", "the facility cluster", "register / create / sync / inspect an ArgoCD Application", "deploy via ArgoCD", "why is my facility kubectl failing with an x509 / certificate SAN error", "which destination.server for prod vs UAT" — AND for facility CLUSTER-level faults & recovery: the 3-node etcd layout, a facility node down / not pinging / post-reboot recovery, SSH node access, the **post-reboot rebalance** (workloads never return to a rebooted node), the **mjcr DNS round-robin trap** (a node without an ingress replica silently fails ~1-in-3 registry pulls), the **CI-runner placement rule** (never schedule runners on `mjbl-cicd`), the **Harbor postgres SPOF**, post-reboot **sanitize** (NodeLost/`Unknown` pods, stuck `VolumeAttachment`), **Longhorn `degraded` volumes** (incl. a replica stranded on a cordoned node), an ArgoCD app stuck **`OutOfSync`** (the `Replace=true` / bound-PVC trap), and the **mis-airflow deploy model** (tag→ArgoCD manifests vs Release→image).
-version: 0.3.0
+description: This skill should be used when the user asks to operate the MJBL FACILITY cluster or ArgoCD — "where does ArgoCD run", "the facility cluster", "register / create / sync / inspect an ArgoCD Application", "deploy via ArgoCD", "why is my facility kubectl failing with an x509 / certificate SAN error", "which destination.server for prod vs UAT" — AND for facility CLUSTER-level faults & recovery: the 3-node etcd layout, a facility node down / not pinging / post-reboot recovery, SSH node access, the **post-reboot rebalance** (workloads never return to a rebooted node), the **mjcr DNS round-robin trap** (a node without an ingress replica silently fails ~1-in-3 registry pulls), the **CI-runner placement rule** (never schedule runners on `mjbl-cicd`), the **two mjcr SPOFs** (MinIO holds every image layer; postgres holds the metadata — both `replicas:1` on RWO), the **MinIO endpoint layout** (S3 base vs virtual-host vs console, and why the console must never sit on the S3 base), what **`selfHeal` actually guarantees** under ServerSideApply, post-reboot **sanitize** (NodeLost/`Unknown` pods, stuck `VolumeAttachment`), **Longhorn `degraded` volumes** (incl. a replica stranded on a cordoned node), an ArgoCD app stuck **`OutOfSync`** (the `Replace=true` / bound-PVC trap), and the **mis-airflow deploy model** (tag→ArgoCD manifests vs Release→image).
+version: 0.4.0
 ---
 
 # MJBL Facility Cluster + ArgoCD
@@ -105,12 +105,41 @@ k -n harbor         rollout restart deploy/harbor-core deploy/harbor-registry de
 ```
 **Skip `harbor-jobservice`** — single replica on an RWO Longhorn PVC; restarting it risks the Multi-Attach / stuck-VolumeAttachment trap for no gain. `harbor-core` / `harbor-registry` / `harbor-portal` have **no PVCs** (object storage via MinIO `10.88.101.192`), so they move cleanly.
 
-## 🚨 Harbor's database is a single-replica SPOF
-`cattle-system-dbfacility/postgresql-0` — a StatefulSet on RWO Longhorn PVC `data-postgresql-0`. **Any node loss where it sits takes the whole internal registry down** (both `harbor-core` replicas go 0/1 → `mjcr` 503). Recovery when it crash-loops with `Input/output error` on `postmaster.pid` (wedged mount after a node stall):
+## 🚨 mjcr has TWO single-replica SPOFs: MinIO (its storage) and postgres (its metadata)
+Harbor itself is multi-replica and looks resilient. It is not — **both of its stateful dependencies are `replicas: 1` on RWO Longhorn volumes**, and losing either takes `mjcr` down.
+
+### MinIO — holds EVERY container image
+`minio/minio` is Harbor's **S3 backend**. `harbor-registry` carries no PVC of its own; it is configured with `storage.s3.regionendpoint: http://minio.minio.svc.cluster.local:9000`, bucket `harbor`. So the **100Gi Longhorn RWO volume in ns `minio` is where all of mjcr's layers actually live** — not anywhere in the `harbor` namespace. Buckets: `harbor`, `github-actions`, `github-packages`.
+
+⚠️ **`replicas: 1` + `strategy: Recreate` + RWO ⇒ ANY change to `.spec.template` is an mjcr outage.** The old pod must fully terminate and the volume detach before the replacement attaches (~20–35s measured). Never edit the Deployment as a drive-by; batch template changes into one window. Check you are not about to cause one:
+```bash
+k -n minio get deploy minio -o jsonpath='{.metadata.generation}'   # bumps only on .spec changes
+k -n minio get rs                                                  # a NEW ReplicaSet = the template changed
+```
+**Recovery** is the same wedged-mount pattern as postgres — on `Input/output error` after a node stall, `k -n minio delete pod -l app=minio` forces a clean remount (expect a transient `Multi-Attach error`).
+
+**Endpoints** (all TLS from `mjbl-internal-ca`, all → ingress VIP `.190`; GitOps app `minio-facility`, `prune+selfHeal`):
+
+| Host | Purpose |
+|---|---|
+| `minio.vte.mjblao.local` | S3 **base** — ListBuckets + virtual-host parent |
+| `<bucket>.minio.vte.mjblao.local` | S3 virtual-host (`MINIO_DOMAIN` is set) |
+| `minio-console.vte.mjblao.local` | console UI |
+| `artifacts.mjcr.vte.mjblao.local/harbor` | pre-existing, retained, **intent unclear** |
+| `10.88.101.192:9000` | MetalLB, path-style, **plain HTTP — no TLS** |
+
+**The console must NEVER sit on the S3 base domain.** `GET /` on an S3 endpoint is *ListBuckets* — what `mc alias set` and every SDK calls to validate an endpoint. Parking the console there breaks all virtual-host clients, and with `MINIO_BROWSER_REDIRECT_URL` pointing at the same host the S3 root 307s to itself in an infinite loop. Both were hit for real on 2026-09-21.
+
+**The console is embedded in the server binary** (`--console-address :9001`) and manages only its own instance — `/api/v1/servers`, `/tenants`, `/sites` all 404. **An external MinIO can never be federated into it**; give it its own console host, use `mc` aliases, or join them with site replication.
+
+### postgres — holds Harbor's metadata
+`cattle-system-dbfacility/postgresql-0`, StatefulSet on RWO Longhorn PVC `data-postgresql-0`. Losing it takes both `harbor-core` replicas to 0/1 → `mjcr` 503. Recovery when it crash-loops with `Input/output error` on `postmaster.pid` (wedged mount after a node stall):
 ```bash
 k -n cattle-system-dbfacility delete pod postgresql-0     # forces a clean unmount/remount
 ```
-Expect a transient `Multi-Attach error` / *"volume is not ready for workloads"* for ~80s, then it attaches and starts. Also note it pulls **`registry-1.docker.io/bitnami/postgresql:latest`** — an unpinned tag on a chart Bitnami has paywalled; pin it and mirror into Harbor. Redis (`storage-facility`) is a related dependency; `redis-replicas-0` has been CrashLoopBackOff for 40d+ (pre-existing).
+Expect a transient `Multi-Attach error` / *"volume is not ready for workloads"* for ~80s, then it attaches and starts. It also pulls **`registry-1.docker.io/bitnami/postgresql:latest`** — an unpinned tag on a chart Bitnami has paywalled; pin it and mirror into Harbor. Redis (`storage-facility`) is a related dependency; `redis-replicas-0` has been CrashLoopBackOff for 40d+ (pre-existing).
+
+**Neither has HA and neither is replicated off-cluster.** For MinIO the real remedy is site replication (`mc admin replicate add`), not another console.
 
 ## ArgoCD topology (critical)
 ArgoCD runs HERE and deploys to **other** clusters registered as external clusters — so an Application's `destination.server` is the **target** cluster, never `https://kubernetes.default.svc` (which = facility):
@@ -167,6 +196,26 @@ k -n longhorn-system get engines.longhorn.io \
    k -n longhorn-system patch volumes.longhorn.io <vol> --type=merge -p '{"spec":{"numberOfReplicas":2}}'
    k -n longhorn-system patch settings.longhorn.io default-replica-count --type=merge -p '{"value":"2"}'
    ```
+
+## What `selfHeal` actually guarantees (it is narrower than it sounds)
+Every app here uses `ServerSideApply=true`, which means **ArgoCD reconciles only the fields it declares** — not the whole object. Measured on `minio-facility`, 2026-09-21:
+
+| Drift | ArgoCD verdict |
+|---|---|
+| **Added** a label that is not in Git | stays `Synced` — **never reverted** |
+| **Changed** a field that IS in Git | `OutOfSync` in ~15s, reverted in ~30s |
+
+So an extra label/annotation set by a human or another controller is co-owned and simply survives. Do not rely on `selfHeal` to catch *every* manual change — only divergence from declared fields. To make a deliberate change during an incident, suspend automated sync FIRST or it is reverted under you:
+```bash
+k -n argocd patch application <app> --type merge -p '{"spec":{"syncPolicy":{"automated":null}}}'
+```
+**Adopting existing resources:** all resources show `OutOfSync` on first sync purely because they lack ArgoCD's tracking annotation (`argocd.argoproj.io/tracking-id` — tracking here is by *annotation*, not label). That is not a content diff. Prove it before syncing something risky:
+```bash
+k -n argocd patch application <app> --type=merge \
+  -p '{"operation":{"initiatedBy":{"username":"ops"},"sync":{"dryRun":true,"syncStrategy":{"apply":{}}}}}'
+k -n argocd get application <app> -o jsonpath='{.status.operationState.syncResult.resources}'
+```
+⚠️ **Once an app is adopted, stop using `kubectl apply` on its manifests** — your local files have no tracking annotation, so a direct apply strips it and bumps `generation`. Change Git and let ArgoCD apply. `prune` only deletes resources in the app's managed tree; owned children (e.g. ReplicaSets, which *inherit* the annotation from their Deployment) are never prune candidates, and untracked objects — like a hand-managed Secret — are out of reach entirely.
 
 ## ArgoCD app stuck `OutOfSync` on a bound PVC (the `Replace=true` trap)
 An app with app-level `syncOptions: Replace=true` and a standalone, dynamically-bound PVC tries to `kubectl replace` the PVC every sync and **fails** on the immutable `spec.volumeName` → stuck `OutOfSync` but **non-destructive** (replace errors *before* any delete → PVC stays `Bound`, `Health=Healthy`). A resource-level `argocd.argoproj.io/sync-options: Replace=false` does **nothing** — ArgoCD only checks for the literal presence of `Replace=true`. FIX = remove app-level `Replace=true`, **then trigger one sync** (an app with `automated` but no `selfHeal` won't auto-retry a `Failed` op):
