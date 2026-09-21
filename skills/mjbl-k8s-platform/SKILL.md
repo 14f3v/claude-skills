@@ -23,11 +23,15 @@ version: 0.1.0
 | Cluster | Role | kubeconfig / context | Control-plane / key node | Deploy mechanism |
 |---|---|---|---|---|
 | **Production (`rkek8s`)** | live prod (mTLS platform, microloan, lapnet, gold-price prod…) | `~/.kube/mjbl-prod.config` | `mjbl-k8s-n01..n04` (`10.88.101.32/.31` + `10.88.1.27/.26`) | **ArgoCD** (from facility) → `https://rkek8s.vte.mjblao.local:6443` |
-| **Facility** | **runs ArgoCD** (`argocd.vte.mjblao.local`) + facility apps | `~/.kube/mjbl-facility.config` ⚠ needs `--tls-server-name=registry.k8sapi.local` | k8s 1.31 | self / Helm |
+| **Facility** | **runs ArgoCD** (`argocd.vte.mjblao.local`) + Harbor/`mjcr`, facility apps | `~/.kube/mjbl-facility.config` ⚠ needs `--tls-server-name=registry.k8sapi.local` | **3 nodes**, all cp+etcd+worker, k8s 1.31: `mjbl-registry` `10.88.101.35`, `mjbl-cicd` `.36`, `k8s-fc-033` `.38` (**cordoned**) | self / Helm |
 | **UAT** | UAT apps (approval-form, partner-payment, gold-price uat, itprofiler-alert) | `~/.kube/mjbl-uat.config` — ⚠️ **NOT the default ctx any more** (corrected 2026-08-31; bare `kubectl` = PROD) | `mjbl-graphql-api` `192.168.1.65` (+ `mb2-uat` `.66`, `appgateway` `.61`) | **ArgoCD** (from facility) → `https://192.168.1.65:6443` |
 | **DR** | DR site — single-node **v1.31**, **standalone** (NOT a prod mirror; lean kubeadm+Calico+local-path; no DC ArgoCD/Harbor, but runs its OWN **local Rancher CD**) | `~/.kube/dr-config` (**on the Mac**, not the ops box) | `dr-k8s-n1` `10.99.1.160` | **local Rancher CD (Fleet)** on DR, watching k8s-config `dr/` overlays (`kubectl apply` / `dr-deploy.sh` DEPRECATED) |
 
-**Networks:** prod = `10.88.101.x` (DMZ/MetalLB) + `10.88.1.x` (internal). UAT/facility/ops = `192.168.1.x`. DR = `10.99.1.x`. **The office/UAT LAN (`192.168.1.x`) is segmented from prod (`10.88.x`)** — you cannot reach prod IPs from `192.168.1.25` ("No route to host"); test prod from a prod-network host (see access below).
+**Networks:** prod = `10.88.101.x` (DMZ/MetalLB) + `10.88.1.x` (internal). **Facility = `10.88.101.x`** (same DMZ range as prod — *not* `192.168.1.x`). UAT/ops = `192.168.1.x`. DR = `10.99.1.x`.
+
+⚠️ **The segmentation is narrower than "192.168.1.x can't reach 10.88.x"** (verified 2026-09-21):
+- `10.88.101.x` (DMZ) **IS** reachable from both the ops box `192.168.1.25` and the Mac — so facility *and* the prod DMZ nodes are directly usable from the office LAN.
+- `10.88.1.x` (prod **internal**) is **not** reachable from the ops box; test those from a prod-network host (see access below). The Mac reaches some `10.88.1.x` via VPN.
 
 ## ArgoCD topology (the one thing people get wrong)
 ArgoCD runs on the **facility** cluster and manages **prod** and **UAT** as **registered external clusters** — so an Application's `destination.server` is the *target* cluster's API URL, **NOT** `https://kubernetes.default.svc` (that would target facility itself):
