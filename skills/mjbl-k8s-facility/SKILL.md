@@ -1,7 +1,7 @@
 ---
 name: mjbl-k8s-facility
-description: This skill should be used when the user asks to operate the MJBL FACILITY cluster or ArgoCD — "where does ArgoCD run", "the facility cluster", "register / create / sync / inspect an ArgoCD Application", "deploy via ArgoCD", "why is my facility kubectl failing with an x509 / certificate SAN error", "which destination.server for prod vs UAT" — AND for facility CLUSTER-level faults & recovery: the 3-node etcd layout, a facility node down / not pinging / post-reboot recovery, SSH node access, the **post-reboot rebalance** (workloads never return to a rebooted node), the **mjcr DNS round-robin trap** (a node without an ingress replica silently fails ~1-in-3 registry pulls), the **CI-runner placement rule** (never schedule runners on `mjbl-cicd`), the **two mjcr SPOFs** (MinIO holds every image layer; postgres holds the metadata — both `replicas:1` on RWO), the **MinIO endpoint layout** (S3 base vs virtual-host vs console, and why the console must never sit on the S3 base), what **`selfHeal` actually guarantees** under ServerSideApply, post-reboot **sanitize** (NodeLost/`Unknown` pods, stuck `VolumeAttachment`), **Longhorn `degraded` volumes** (incl. a replica stranded on a cordoned node), an ArgoCD app stuck **`OutOfSync`** (the `Replace=true` / bound-PVC trap), and the **mis-airflow deploy model** (tag→ArgoCD manifests vs Release→image).
-version: 0.4.0
+description: This skill should be used when the user asks to operate the MJBL FACILITY cluster or ArgoCD — "where does ArgoCD run", "the facility cluster", "register / create / sync / inspect an ArgoCD Application", "deploy via ArgoCD", "why is my facility kubectl failing with an x509 / certificate SAN error", "which destination.server for prod vs UAT" — AND for facility CLUSTER-level faults & recovery: the 3-node etcd layout, a facility node down / not pinging / post-reboot recovery, SSH node access, the **post-reboot rebalance** (workloads never return to a rebooted node), the **mjcr DNS round-robin trap** (a node without an ingress replica silently fails ~1-in-3 registry pulls), the **CI-runner placement rule** (never schedule runners on `mjbl-cicd`), the **two mjcr SPOFs** (MinIO holds every image layer; postgres holds the metadata — both `replicas:1` on RWO), the **MinIO endpoint layout** (S3 base vs virtual-host vs console, and why the console must never sit on the S3 base), what **`selfHeal` actually guarantees** under ServerSideApply, post-reboot **sanitize** (NodeLost/`Unknown` pods, stuck `VolumeAttachment`), **Longhorn `degraded` volumes** (incl. a replica stranded on a cordoned node), an ArgoCD app stuck **`OutOfSync`** (the `Replace=true` / bound-PVC trap), the **GitOps inventory** (what is adopted vs still unmanaged Helm), the **backups** (snapshots + nightly pg_dump — and why they are not DR), **sealed-secrets** (incl. the adoption trap where the controller refuses a pre-existing Secret), **adopting a Helm release into GitOps** with zero restarts, and the **mis-airflow deploy model** (tag→ArgoCD manifests vs Release→image).
+version: 0.5.0
 ---
 
 # MJBL Facility Cluster + ArgoCD
@@ -106,7 +106,7 @@ k -n harbor         rollout restart deploy/harbor-core deploy/harbor-registry de
 **Skip `harbor-jobservice`** — single replica on an RWO Longhorn PVC; restarting it risks the Multi-Attach / stuck-VolumeAttachment trap for no gain. `harbor-core` / `harbor-registry` / `harbor-portal` have **no PVCs** (object storage via MinIO `10.88.101.192`), so they move cleanly.
 
 ## 🚨 mjcr has TWO single-replica SPOFs: MinIO (its storage) and postgres (its metadata)
-Harbor itself is multi-replica and looks resilient. It is not — **both of its stateful dependencies are `replicas: 1` on RWO Longhorn volumes**, and losing either takes `mjcr` down.
+Harbor itself is multi-replica and looks resilient. It is not — **both of its stateful dependencies are `replicas: 1` on RWO Longhorn volumes**, and losing either takes `mjcr` down. Since 2026-09-21 both are backed up (see below) and postgres is image-pinned, but neither is HA.
 
 ### MinIO — holds EVERY container image
 `minio/minio` is Harbor's **S3 backend**. `harbor-registry` carries no PVC of its own; it is configured with `storage.s3.regionendpoint: http://minio.minio.svc.cluster.local:9000`, bucket `harbor`. So the **100Gi Longhorn RWO volume in ns `minio` is where all of mjcr's layers actually live** — not anywhere in the `harbor` namespace. Buckets: `harbor`, `github-actions`, `github-packages`.
@@ -137,9 +137,96 @@ k -n minio get rs                                                  # a NEW Repli
 ```bash
 k -n cattle-system-dbfacility delete pod postgresql-0     # forces a clean unmount/remount
 ```
-Expect a transient `Multi-Attach error` / *"volume is not ready for workloads"* for ~80s, then it attaches and starts. It also pulls **`registry-1.docker.io/bitnami/postgresql:latest`** — an unpinned tag on a chart Bitnami has paywalled; pin it and mirror into Harbor. Redis (`storage-facility`) is a related dependency; `redis-replicas-0` has been CrashLoopBackOff for 40d+ (pre-existing).
+Expect a transient `Multi-Attach error` / *"volume is not ready for workloads"* for ~80s, then it attaches and starts.
 
-**Neither has HA and neither is replicated off-cluster.** For MinIO the real remedy is site replication (`mc admin replicate add`), not another console.
+🔒 **The image is DIGEST-PINNED** (2026-09-21) to `bitnami/postgresql@sha256:7d77a46b…` = PostgreSQL 18.6. Do **not** revert it to a tag. There is no version tag to use: Bitnami stripped them from the free repo — `bitnami/postgresql` now carries **only `latest`** plus signature artifacts (zero version tags among 878), and `bitnamilegacy/postgresql` has 3948 tags but **none for 18.x**. `imagePullPolicy` is `IfNotPresent`, so the danger was never a running pod — it was a **cold cache**: a reschedule or node rebuild pulling a new major version against an 18.x data directory. ⚠️ postgres is still an **unmanaged Helm release**, so `helm upgrade` silently un-pins it. A copy lives at `mjcr/library/bitnami-postgresql:18.6-pinned` as insurance — but **never make that the live ref**: postgres pulling from Harbor, which needs postgres, is a bootstrap deadlock.
+
+Redis (`storage-facility`) is a related dependency. `redis-replicas-0` was CrashLoopBackOff for 40+ days (308 restarts) — root cause a **corrupt AOF on a healthy Longhorn volume** (`can't open … appendonly.aof.manifest: Input/output error`). Fixed 2026-09-21 by deleting the replica's PVC + pod so it resynced from master; replica data is disposable and Harbor only uses `redis-master`.
+
+**Neither has HA and neither is replicated off-cluster.** For MinIO the real remedy is site replication (`mc admin replicate add`), not another console. Both are now covered by scheduled **snapshots + a nightly logical dump** — see the backups section.
+
+## What is under GitOps on facility (and what still is not)
+As of 2026-09-21, twelve Applications target facility (`destination.server: https://kubernetes.default.svc`):
+
+`harbor-facility` · `minio-facility` · `sealed-secrets` · `facility-backups` · `mjcr-tls` ·
+`internal-ca-facility` · `litellm-facility` · `openwebui-facility` · `tika-facility` ·
+`mis-airflow` · `monitoring-stack` · `facility-prometheus-lb`
+
+**Harbor and MinIO were adopted from unmanaged Helm releases** — their release secrets and all
+`meta.helm.sh/*` metadata are gone, so `helm list` shows nothing for them. Do **not** try to
+`helm upgrade` either; change Git.
+
+⚠️ **Still unmanaged Helm releases** — a `helm upgrade` on any of these silently reverts hand-made
+changes (this is how the postgres pin could be lost): `postgresql` (cattle-system-dbfacility),
+`redis` (storage-facility), plus the platform's own charts — `rancher`, `rancher-monitoring`,
+`longhorn`, `cert-manager`, `fleet`, `kong`, `actions-runner-controller`.
+
+## Backups exist now — but they are NOT disaster recovery
+Before 2026-09-21 the cluster had **no backup mechanism at all**: zero backup CronJobs, zero
+Longhorn recurringjobs. App `facility-backups` adds:
+
+| What | Where | When |
+|---|---|---|
+| `RecurringJob/daily-snapshot` | `longhorn-system`, group `default` = **all** volumes | 18:00 UTC, retain 7 |
+| `CronJob/harbor-db-dump` | `cattle-system-dbfacility` → 2Gi PVC | 17:30 UTC, retain 30 |
+
+⚠️ **`backup-target` is EMPTY**, so nothing leaves the cluster. Snapshots protect against logical
+damage (an accidental delete, corruption) — **not** against losing the volume, disk or cluster.
+An external target is deliberately not configured: the only S3 in reach is MinIO, which runs here
+and is itself one of the protected volumes.
+
+The **logical dump matters separately from the snapshots**: a snapshot restores the postgres data
+directory, which is bound to the server major version, whereas `pg_dump -Fc` restores into any
+newer server. The dump job pins its image by digest so it keeps working the day the postgres tag
+moves. Verify a dump is real, not just present:
+```bash
+k -n cattle-system-dbfacility create job --from=cronjob/harbor-db-dump check-$(date -u +%H%M)
+# then pg_restore --list the newest /dumps/harbor-*.dump — it must parse and show `project`,
+# `harbor_user`, `robot`, `replication_policy`. A dump <10000 bytes fails the job by design.
+```
+
+## 🚨 sealed-secrets — and the adoption trap that will catch you
+Controller `v0.40.0` in `kube-system`, vendored (the chart repo `bitnami-labs.github.io/sealed-secrets`
+**404s from this network**). `kubeseal` defaults to `kube-system`, so do not relocate it.
+
+**The sealing key is the whole ballgame.** Every SealedSecret in `k8s-config` is decryptable only
+by the key in `kube-system` labelled `sealedsecrets.bitnami.com/sealed-secrets-key=active`. It is an
+**etcd object — the Longhorn snapshots do NOT cover it.** Back it up off-cluster:
+```bash
+k -n kube-system get secret -l sealedsecrets.bitnami.com/sealed-secrets-key=active -o yaml
+```
+
+⚠️ **THE TRAP: the controller refuses to adopt a Secret that already exists.** You get
+`failed update: Resource "X" already exists and is not managed by SealedSecret`, the SealedSecret
+sits `Synced=False`, and the app reports **Degraded** while every per-resource health looks fine.
+That is a *safety feature* — the live Secret is never clobbered. To adopt an existing Secret:
+```bash
+k -n <ns> annotate secret <name> sealedsecrets.bitnami.com/managed=true --overwrite
+k -n kube-system rollout restart deploy/sealed-secrets-controller   # REQUIRED
+```
+The restart is **not optional**: the controller logs `update suppressed, no changes in spec` and
+will not retry on a metadata-only change. Do one secret at a time, hashing `.data` before and
+after. Done correctly the Secret is **adopted, not recreated** — its original `creationTimestamp`
+survives and the data is byte-identical.
+
+⚠️ `kubeseal` refuses empty data (`secret.data is empty … assuming this is an error`). An empty
+Secret that must exist anyway — like `harbor-registryctl`, which both `harbor-registry` pods
+`envFrom` — belongs in Git as a **plain** Secret; there is nothing in it to protect.
+
+## Adopting an unmanaged Helm release into GitOps (the proven method)
+Used for MinIO and Harbor on 2026-09-21; **zero restarts** both times. The full generalised
+playbook lives in the `agent-skills` repo as `helm-to-gitops-adoption`. In short:
+
+1. **Generate manifests FROM the live objects** — never hand-write them.
+2. `kubectl diff` until empty. **Do not proceed on an unexplained diff.**
+3. Application ships **register-only** (`automated:` commented out).
+4. One manual sync, then verify **no new ReplicaSet** and unchanged restart counts — that, not
+   `Synced/Healthy`, is the proof nothing rolled.
+5. Only then enable `automated: prune + selfHeal`.
+6. **Delete the Helm release secret LAST** — until it is gone, `helm rollback` still works.
+
+⚠️ Inventory labels before stripping `meta.helm.sh/*` / `heritage` / `chart`: `release: <name>` is
+usually part of the **immutable** `spec.selector.matchLabels` and must survive.
 
 ## ArgoCD topology (critical)
 ArgoCD runs HERE and deploys to **other** clusters registered as external clusters — so an Application's `destination.server` is the **target** cluster, never `https://kubernetes.default.svc` (which = facility):
