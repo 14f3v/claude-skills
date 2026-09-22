@@ -32,6 +32,16 @@ Operational skills for the **live MJBL mTLS ecosystem deployed on this host** �
 
 This repo is the source of truth for **user-scope** skills (`~/.claude/skills/<name>`). It intentionally does **not** mirror skills delivered by plugins (under `~/.claude/plugins/`) — e.g. the `superpowers:*`, `astronomer-data:*`, `ui-ux-pro-max:*`, `skill-creator`, `frontend-design`, `claude-api`, and the various Anthropic agent-skills marketplace entries. Those are owned and updated by their plugin marketplaces; copying them in here would diverge and rot. Install/update them through the plugin system, not this repo.
 
+## MJBL GitHub Enterprise Server (`/mjbl:ghes:*`)
+
+Licensing and seat operations for the **live GHES appliance** `github.vte.mjblao.local` (**10.88.101.37**, GHES 3.15.2, single node, services under Nomad). There is no `/home/mjbl` runbook for GHES — **the appliance itself is the source of truth**, so every figure in the skill is stamped with the date it was measured.
+
+| Skill | Command | What it covers |
+|---|---|---|
+| [`mjbl-ghes-licensing`](skills/mjbl-ghes-licensing/SKILL.md) | `/mjbl:ghes:license` | Seat extension end-to-end: the `ghe-license` CLI and its **non-mutating** `info --pipe -j` dry run, backing up the outgoing `.ghl` (the appliance keeps none), `import --pipe --apply`, what `ghe-github-restart` actually does, proving the change landed via Nomad (not systemd), live seat accounting through `ghe-console`, and rollback. Licensing/seats only. |
+
+> Scoped deliberately: appliance upgrades, backup/restore, `ghe-config-apply`, TLS renewal, Actions, LDAP and HA are **not** covered — the `/mjbl:ghes:*` namespace is reserved for a future `mjbl-ghes-appliance` skill. Certificate work for the appliance belongs to [`mjbl-ca-operations`](skills/mjbl-ca-operations/SKILL.md).
+
 ## Install (new machine bootstrap)
 
 This repo can be consumed two ways. Pick whichever fits the machine.
