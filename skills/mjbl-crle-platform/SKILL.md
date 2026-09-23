@@ -25,27 +25,31 @@ version: 0.1.0
 Both in ns **`crle`** on prod `rkek8s`. Secrets are out-of-band: `crle-env`, `github-pat`
 (cloned from any existing ns; all authenticate as `digital`).
 
-## 🚨 Same origin is the whole design
+## 🚨 Two channels, different jobs
+
+```
+Ingress   https://crle.vte.mjblao.local   SPA at /  +  API at /auth,/crle,/health   (UI lives here)
+Gateway   http://10.88.101.144:8010       API ONLY  — /auth,/crle,/health; all else 404
+```
 
 Every API call in the SPA (`src/app/services/restapi.ts`) is a **relative** URL with
-`withCredentials: true`. Both front doors serve SPA + API from **one** origin:
+`withCredentials: true`, so the **Ingress must serve both from one origin** — crle sets
+`AllowOrigins:["*"]` *with* `AllowCredentials:true`, a pair browsers reject outright for
+credentialed requests. **Never give the SPA its own hostname/IP.**
 
-```
-/         -> cbs-fn.crle.svc:80      /auth/  /crle/  /health -> crle.crle.svc:3000
-  channel 1   http://10.88.101.144:8010            (api-gateway `crle` site, MetalLB, shared IP)
-  channel 2   https://crle.vte.mjblao.local        (Ingress, mjbl-internal-ca)
-```
+The gateway site served the SPA too until 2026-09-23; it is now API-only by design. Do not
+re-add a `location /` there expecting the UI on the VIP.
 
-**Never give the SPA its own hostname/IP.** crle sets `AllowOrigins:["*"]` *with*
-`AllowCredentials:true` — a pair browsers reject outright for credentialed requests. The
-gateway keeps a fail-closed origin allowlist as a safety net, but the real client never
-triggers CORS because it is same-origin.
+⚠️ **CORS is LIVE on the gateway channel**, not dormant. With no SPA in that server block, any
+browser calling the API there is by definition cross-origin and the fail-closed
+`map $http_origin $crle_cors_origin` allowlist decides the outcome. Nothing needs it today
+(the SPA calls the API on the Ingress origin), but a browser client pointed at `:8010` must have
+its origin added or be refused. Server-to-server callers are unaffected.
 
-`/` has **no Angular route** (`app.routes.ts` leaves the empty path commented out), so both
-channels redirect it: gateway `location = / { return 302 /home; }`, Ingress
-`nginx.ingress.kubernetes.io/app-root: /home`. A typo like `/dashbord` still renders blank —
-that needs a `**` route in the app and cannot be fixed at the edge (the SPA answers 200 for
-every path via `try_files`).
+`/` has **no Angular route** (`app.routes.ts` leaves the empty path commented out), so the
+Ingress redirects it via `nginx.ingress.kubernetes.io/app-root: /home`. A typo like `/dashbord`
+still renders blank — that needs a `**` route in the app and cannot be fixed at the edge (the
+SPA answers 200 for every path via `try_files`).
 
 ## Login (AD) — every failure is an HTTP 500
 
