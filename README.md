@@ -42,6 +42,27 @@ Licensing and seat operations for the **live GHES appliance** `github.vte.mjblao
 
 > Scoped deliberately: appliance upgrades, backup/restore, `ghe-config-apply`, TLS renewal, Actions, LDAP and HA are **not** covered — the `/mjbl:ghes:*` namespace is reserved for a future `mjbl-ghes-appliance` skill. Certificate work for the appliance belongs to [`mjbl-ca-operations`](skills/mjbl-ca-operations/SKILL.md).
 
+## MJBL CRLE application (`/mjbl:crle`)
+
+The **Customized Retail Lending Engine** — a Go/Gin API (`core-banking-mis/crle`) and an Angular SPA
+(`mjbl-digital/cbs_fn`) running together in namespace `crle` on prod `rkek8s`. Built end-to-end as a
+GitOps+CD exercise: a repo with a committed binary, no Dockerfile, no CI and no deployment became a
+released, ArgoCD-reconciled workload.
+
+| Skill | Command | What it covers |
+|---|---|---|
+| [`mjbl-crle-platform`](skills/mjbl-crle-platform/SKILL.md) | `/mjbl:crle` | Two-component topology in one namespace; the **same-origin** serving model across both channels (`10.88.101.144:8010` via the api-gateway site, and `https://crle.vte.mjblao.local` via Ingress); AD login diagnosis where **every** failure is an HTTP 500; the Secret traps (dotenv quoting lost through Kubernetes, the percent-encoded Oracle password); the OD-penalty job that fires **at pod startup**; and the GHES Actions pipeline with its cross-org runner, `GITOPS_PAT` visibility and tag-ruleset traps. |
+
+> **Why same-origin is load-bearing:** the SPA calls the API with **relative** URLs and
+> `withCredentials: true`, while the API advertises `AllowOrigins:["*"]` together with
+> `AllowCredentials:true` — a pair browsers reject outright. Serving both from one origin means CORS
+> never engages. **Do not give the SPA its own hostname or IP.**
+>
+> **Why deploys are not routine:** `prod.crle` runs `automated: {prune, selfHeal}` and the app
+> executes the OD-penalty job at pod startup. While `FN_OD_PENALTY_CALC` is ungranted this fails
+> harmlessly; once granted, **any release that restarts the pod charges fees against live accounts**.
+> Suspend auto-sync first.
+
 ## Install (new machine bootstrap)
 
 This repo can be consumed two ways. Pick whichever fits the machine.
